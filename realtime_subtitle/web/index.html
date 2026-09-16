@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>reSpeaker 实时双语字幕</title>
+<style>
+:root{
+  --glass: rgba(255,255,255,.06);
+  --glass-strong: rgba(255,255,255,.10);
+  --border: rgba(255,255,255,.14);
+  --text: rgba(238,242,247,.92);
+  --text-dim: rgba(238,242,247,.45);
+  --accent: #4cc9f0;
+  --accent-2: #7b6cf6;
+  --ok: #34d399; --err: #f87171; --info: #60a5fa;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:"Segoe UI",system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+  color:var(--text);
+  background:#0a0f1e;
+  background-image:
+    radial-gradient(60rem 40rem at 15% 10%, rgba(76,201,240,.14), transparent 60%),
+    radial-gradient(50rem 36rem at 85% 45%, rgba(123,108,246,.12), transparent 60%),
+    radial-gradient(46rem 30rem at 50% 100%, rgba(251,146,60,.07), transparent 65%);
+  overflow-x:hidden;
+}
+header{
+  position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:.7rem;
+  padding:.8rem 1.1rem;
+  background:rgba(13,18,33,.55);
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  border-bottom:1px solid var(--border);
+}
+.logo{width:26px;height:26px;border-radius:8px;
+  background:linear-gradient(135deg,var(--accent),var(--accent-2));
+  animation:breathe 3.2s ease-in-out infinite}
+@keyframes breathe{0%,100%{opacity:.75;transform:scale(.96)}50%{opacity:1;transform:scale(1)}}
+header h1{font-size:1rem;font-weight:600;letter-spacing:.02em}
+.spacer{flex:1}
+#dot{width:9px;height:9px;border-radius:50%;background:#64748b;transition:background .3s;
+  box-shadow:0 0 10px transparent}
+#dot.on{background:var(--ok);box-shadow:0 0 12px var(--ok);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+#gate{font-size:.72rem;color:var(--text-dim);min-width:5.2em}
+#gear{width:36px;height:36px;border:1px solid var(--border);border-radius:10px;
+  background:var(--glass);color:var(--text);cursor:pointer;display:grid;place-items:center;
+  transition:transform .35s ease, background .2s}
+#gear:hover{transform:rotate(45deg);background:var(--glass-strong)}
+#gear svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6}
+main{max-width:860px;margin:0 auto;padding:1.1rem 1rem 6rem;display:flex;
+  flex-direction:column;gap:.8rem}
+#empty{display:flex;flex-direction:column;align-items:center;gap:1rem;
+  padding:5rem 0;color:var(--text-dim)}
+#empty .ring{width:64px;height:64px;border-radius:50%;border:2px solid var(--border);
+  border-top-color:var(--accent);animation:spin 2.4s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.card{
+  position:relative;background:var(--glass);
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  border:1px solid var(--border);border-radius:14px;padding:.9rem 1rem .95rem 1.2rem;
+  animation:rise .35s ease both;
+}
+@supports not (backdrop-filter:blur(1px)){.card{background:rgba(20,26,44,.85)}}
+@keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.card::before{content:"";position:absolute;left:0;top:14%;bottom:14%;width:3px;
+  border-radius:3px;background:linear-gradient(180deg,var(--accent),var(--accent-2))}
+.meta{display:flex;align-items:center;gap:.5rem;margin-bottom:.45rem;flex-wrap:wrap}
+.pill{font-size:.68rem;padding:.14rem .55rem;border-radius:99px;color:var(--accent);
+  background:rgba(76,201,240,.10);border:1px solid rgba(76,201,240,.28)}
+.pill.src{color:#fbbf24;background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.25)}
+.src-text{font-size:1.02rem;line-height:1.55}
+.trans{margin-top:.5rem;padding-top:.5rem;border-top:1px dashed var(--border);
+  font-size:.98rem;line-height:1.5;color:var(--accent)}
+.trans.pending{color:var(--text-dim);animation:shimmer 1.6s ease-in-out infinite}
+@keyframes shimmer{0%,100%{opacity:.55}50%{opacity:.95}}
+.trans .lang{font-size:.66rem;font-family:ui-monospace,Consolas,monospace;
+  color:var(--text-dim);margin-left:.4rem}
+/* drawer */
+#mask{position:fixed;inset:0;background:rgba(6,9,18,.45);backdrop-filter:blur(6px);
+  -webkit-backdrop-filter:blur(6px);opacity:0;pointer-events:none;transition:opacity .3s;z-index:8}
+#mask.show{opacity:1;pointer-events:auto}
+#drawer{position:fixed;top:0;right:0;bottom:0;width:min(360px,92vw);z-index:9;
+  background:rgba(15,20,36,.92);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+  border-left:1px solid var(--border);transform:translateX(102%);transition:transform .32s ease;
+  overflow-y:auto;padding:1.2rem 1.1rem 2rem}
+#drawer.show{transform:none}
+#drawer h2{font-size:.95rem;margin-bottom:.2rem}
+#drawer .sub{font-size:.72rem;color:var(--text-dim);margin-bottom:1rem}
+.section{margin-top:1.2rem}
+.section h3{font-size:.8rem;color:var(--text-dim);margin-bottom:.55rem;display:flex;
+  align-items:center;gap:.45rem}
+.badge{font-size:.6rem;padding:.08rem .4rem;border-radius:99px;background:rgba(251,146,60,.15);
+  color:#fb923c;border:1px solid rgba(251,146,60,.3)}
+select,input[type=text]{
+  width:100%;padding:.5rem .6rem;margin-bottom:.55rem;border-radius:9px;color:var(--text);
+  background:rgba(255,255,255,.05);border:1px solid var(--border);outline:none;font-size:.85rem;
+  transition:border-color .2s, background .2s;
+}
+select:hover,input[type=text]:hover{border-color:rgba(255,255,255,.28)}
+select:focus,input[type=text]:focus{border-color:var(--accent)}
+.btn{padding:.55rem 1rem;border:none;border-radius:9px;cursor:pointer;font-size:.83rem;
+  font-weight:600;color:#06121f;background:linear-gradient(135deg,var(--accent),#5eead4);
+  transition:filter .2s, transform .1s}
+.btn:hover{filter:brightness(1.08)}
+.btn:active{transform:scale(.98)}
+.btn.ghost{background:var(--glass-strong);color:var(--text);border:1px solid var(--border)}
+.row{display:flex;gap:.5rem;align-items:center}
+.row input[type=text]{flex:1;margin:0}
+.del{width:32px;height:32px;border:1px solid var(--border);border-radius:8px;
+  background:transparent;color:var(--text-dim);cursor:pointer;display:grid;place-items:center;
+  transition:all .2s}
+.del:hover{color:var(--err);border-color:rgba(248,113,113,.4)}
+#advToggle{width:100%;text-align:left;padding:.5rem .6rem;border-radius:9px;
+  background:var(--glass);border:1px solid var(--border);color:var(--text);
+  cursor:pointer;font-size:.8rem;display:flex;align-items:center;gap:.5rem}
+#advBody{display:none;margin-top:.6rem}
+#advBody.open{display:block}
+.advgroup{margin-bottom:.7rem;border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.advgroup .ghead{padding:.45rem .6rem;background:var(--glass-strong);font-size:.72rem;
+  color:var(--text-dim);cursor:pointer;display:flex;justify-content:space-between}
+.advgroup .gbody{display:none;padding:.5rem .6rem}
+.advgroup.open .gbody{display:block}
+.cmd{display:flex;gap:.45rem;align-items:center;padding:.3rem 0;font-size:.72rem;
+  font-family:ui-monospace,Consolas,monospace}
+.cmd .cname{flex:1;color:var(--text)}
+.cmd .ro{font-size:.58rem;color:var(--text-dim)}
+.cmd input{width:110px;padding:.28rem .4rem;margin:0;border-radius:6px;font-size:.68rem}
+.mini{padding:.28rem .55rem;border:none;border-radius:6px;cursor:pointer;font-size:.66rem;
+  background:rgba(255,255,255,.1);color:var(--text)}
+.mini:hover{background:rgba(255,255,255,.2)}
+#toast{position:fixed;left:50%;bottom:2rem;transform:translate(-50%,150%);
+  z-index:12;max-width:78vw;padding:.6rem 1.1rem;border-radius:10px;font-size:.82rem;
+  background:rgba(15,20,36,.95);border:1px solid var(--border);color:var(--text);
+  transition:transform .3s ease;backdrop-filter:blur(10px)}
+#toast.show{transform:translate(-50%,0)}
+#toast.ok{border-color:rgba(52,211,153,.5)} #toast.err{border-color:rgba(248,113,113,.5)}
+#toast.info{border-color:rgba(96,165,250,.5)}
+@media(max-width:520px){
+  main{padding:.9rem .8rem 5rem}
+  #drawer{width:94vw}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"></div>
+  <h1>reSpeaker 实时双语字幕</h1>
+  <div class="spacer"></div>
+  <span id="gate">--</span>
+  <div id="dot" title="连接状态"></div>
+  <button id="gear" title="设置">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/>
+    <path d="M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M18.5 5.5l-1.7 1.7M7.2 16.8l-1.7 1.7"/>
+    </svg>
+  </button>
+</header>
+<main id="stream">
+  <div id="empty"><div class="ring"></div>等待说话……</div>
+</main>
+<div id="mask"></div>
+<aside id="drawer">
+  <h2>设置</h2>
+  <div class="sub">运行时配置立即生效</div>
+  <div class="section">
+    <h3>翻译方向</h3>
+    <label style="font-size:.72rem;color:var(--text-dim)">中文 →</label>
+    <select id="zhTo"></select>
+    <label style="font-size:.72rem;color:var(--text-dim)">其他语言 →</label>
+    <select id="otherTo"></select>
+    <button class="btn" id="saveLangs" style="width:100%;margin-top:.3rem">保存方向</button>
+  </div>
+  <div class="section">
+    <h3>DOA 方位标签 <button class="mini" id="addZone">＋</button></h3>
+    <div id="zones"></div>
+    <button class="btn ghost" id="saveZones" style="width:100%;margin-top:.6rem">保存标签</button>
+  </div>
+  <div class="section">
+    <h3>高级 <span class="badge">设备参数</span></h3>
+    <button id="advToggle">▸ USB 命令</button>
+    <div id="advBody"></div>
+  </div>
+</aside>
+<div id="toast"></div>
+<script>
+"use strict";
+let ws = null, reconnectDelay = 500;
+const $ = id => document.getElementById(id);
+const stream = $("stream"), empty = $("empty");
+const cards = new Map();          // id -> card element
+const MAX_CARDS = 50;
+
+function esc(s){
+  return String(s == null ? "" : s).replace(/[&<>"']/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function toast(msg, kind){
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "show " + (kind || "info");
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.className = "", 2600);
+}
+function nearBottom(){
+  return window.innerHeight + window.scrollY >= document.body.scrollHeight - 80;
+}
+function scrollIfStuck(){
+  if (nearBottom()) window.scrollTo({top: document.body.scrollHeight, behavior:"smooth"});
+}
+function removeEmpty(){
+  if (empty && empty.parentNode) empty.remove();
+}
+function cardFor(id){
+  let el = cards.get(id);
+  if (!el){
+    el = document.createElement("div");
+    el.className = "card";
+    el.innerHTML =
+      '<div class="meta"><span class="pill src">partial</span></div>' +
+      '<div class="src-text"></div>' +
+      '<div class="trans pending">翻译中…</div>';
+    stream.appendChild(el);
+    cards.set(id, el);
+    if (cards.size > MAX_CARDS){
+      const oldest = cards.keys().next().value;
+      cards.get(oldest).remove();
+      cards.delete(oldest);
+    }
+  }
+  return el;
+}
+
+function handle(msg){
+  switch (msg.type){
+    case "source":
+      removeEmpty();
+    case "final": {
+      const el = cardFor(msg.id);
+      el.querySelector(".src-text").textContent = msg.text || "";
+      const pill = el.querySelector(".pill");
+      pill.textContent = (msg.lang === "zh" ? "中→" : "外→") + (msg.lang || "?");
+      pill.className = "pill";
+      scrollIfStuck();
+      break;
+    }
+    case "partial": {
+      removeEmpty();
+      const el = cardFor(msg.id);
+      el.querySelector(".src-text").textContent = msg.text || "";
+      scrollIfStuck();
+      break;
+    }
+    case "discard": {
+      const el = cards.get(msg.id);
+      if (el){ el.remove(); cards.delete(msg.id); }
+      if (!cards.size) stream.appendChild(empty);
+      break;
+    }
+    case "translation": {
+      const el = cards.get(msg.id);
+      if (el){
+        const t = el.querySelector(".trans");
+        t.className = "trans";
+        t.innerHTML = esc(msg.text) +
+          '<span class="lang">' + esc(msg.target_lang || "") + "</span>";
+      }
+      scrollIfStuck();
+      break;
+    }
+    case "vad.state":
+      $("gate").textContent = (msg.gate_mode || "--") +
+        (msg.hw_vad ? " · 说" : " · 静");
+      break;
+    case "cmd_result":
+      if (msg.ok === false) toast("命令失败: " + (msg.error || ""), "err");
+      break;
+  }
+}
+
+function sendCmd(cmd, payload){
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({cmd, payload}));
+}
+function onCmdResult(msg){ if (msg.ok === false) toast(msg.error || "failed", "err"); }
+
+function renderTargets(data){
+  const opts = data.options || {};
+  for (const [sel, val] of [["zhTo", data.zh_to], ["otherTo", data.other_to]]){
+    const el = $(sel);
+    el.innerHTML = Object.entries(opts).map(([code, label]) =>
+      '<option value="' + esc(code) + '"' + (code === val ? " selected" : "") +
+      ">" + esc(label) + "</option>").join("");
+  }
+}
+function zoneRow(label){
+  const div = document.createElement("div");
+  div.className = "row";
+  div.innerHTML = '<input type="text" value="' + esc(label) + '">' +
+    '<button class="del" title="删除">✕</button>';
+  div.querySelector(".del").onclick = () => div.remove();
+  return div;
+}
+function renderZones(data){
+  const box = $("zones");
+  box.innerHTML = "";
+  (data.zones || []).forEach(z => box.appendChild(zoneRow(z)));
+}
+function renderCommandGroups(data){
+  const body = $("advBody");
+  body.innerHTML = "";
+  Object.entries(data.groups || {}).forEach(([resid, cmds]) => {
+    const g = document.createElement("div");
+    g.className = "advgroup";
+    const head = document.createElement("div");
+    head.className = "ghead";
+    head.innerHTML = "<span>" + esc(resid) + "</span><span>" + cmds.length + "</span>";
+    const gbody = document.createElement("div");
+    gbody.className = "gbody";
+    cmds.forEach(c => {
+      const row = document.createElement("div");
+      row.className = "cmd";
+      row.innerHTML = '<span class="cname">' + esc(c.name) + "</span>" +
+        (c.access === "ro" ? '<span class="ro">ro</span>' :
+          '<input type="text" placeholder="json">') +
+        '<button class="mini read">读</button>' +
+        (c.access === "rw" ? '<button class="mini write">写</button>' : "");
+      row.querySelector(".read").onclick = () =>
+        sendCmd("read", {name: c.name});
+      const w = row.querySelector(".write");
+      if (w) w.onclick = () => {
+        const raw = row.querySelector("input").value.trim();
+        if (!raw){ toast("需要 JSON 值", "err"); return; }
+        try { sendCmd("write", {name: c.name, value: JSON.parse(raw)}); }
+        catch(e){ toast("非法 JSON: " + e.message, "err"); }
+      };
+      gbody.appendChild(row);
+    });
+    head.onclick = () => g.classList.toggle("open");
+    g.appendChild(head); g.appendChild(gbody);
+    body.appendChild(g);
+  });
+}
+
+function connect(){
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(proto + "://" + location.host + "/ws");
+  ws.onopen = () => {
+    $("dot").classList.add("on");
+    reconnectDelay = 500;
+    sendCmd("get_target_langs");
+    sendCmd("get_zones");
+    sendCmd("list_commands");
+  };
+  ws.onmessage = e => {
+    let m; try { m = JSON.parse(e.data); } catch(err){ return; }
+    if (m.type === "cmd_result"){
+      onCmdResult(m);
+      if (m.data && m.data.options) renderTargets(m.data);
+      if (m.data && m.data.zones) renderZones(m.data);
+      if (m.data && m.data.groups) renderCommandGroups(m.data);
+      return;
+    }
+    handle(m);
+  };
+  ws.onclose = () => {
+    $("dot").classList.remove("on");
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 1.6, 8000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+/* drawer interactions */
+const drawer = $("drawer"), mask = $("mask");
+function openDrawer(){ drawer.classList.add("show"); mask.classList.add("show"); }
+function closeDrawer(){ drawer.classList.remove("show"); mask.classList.remove("show"); }
+$("gear").onclick = () => drawer.classList.contains("show") ? closeDrawer() : openDrawer();
+mask.onclick = closeDrawer;
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+
+$("saveLangs").onclick = () => {
+  sendCmd("set_target_langs", {zh_to: $("zhTo").value, other_to: $("otherTo").value});
+  toast("翻译方向已保存", "ok");
+};
+$("addZone").onclick = () => $("zones").appendChild(zoneRow(""));
+$("saveZones").onclick = () => {
+  const zones = [...document.querySelectorAll("#zones input")].map(i => i.value.trim()).filter(Boolean);
+  sendCmd("set_zones", {zones});
+  toast("方位标签已保存", "ok");
+};
+$("advToggle").onclick = () => {
+  const b = $("advBody");
+  b.classList.toggle("open");
+  $("advToggle").textContent = (b.classList.contains("open") ? "▾ " : "▸ ") + "USB 命令";
+};
+
+connect();
+</script>
+</body>
+</html>
