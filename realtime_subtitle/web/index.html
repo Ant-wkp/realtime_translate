@@ -39,7 +39,6 @@ header{
   animation:breathe 3.2s ease-in-out infinite}
 @keyframes breathe{0%,100%{opacity:.75;transform:scale(.96)}50%{opacity:1;transform:scale(1)}}
 header h1{font-size:1rem;font-weight:600;letter-spacing:.02em}
-#latency{font-size:.72rem;color:var(--text-dim);font-family:ui-monospace,Consolas,monospace}
 .spacer{flex:1}
 #dot{width:9px;height:9px;border-radius:50%;background:#64748b;transition:background .3s;
   box-shadow:0 0 10px transparent}
@@ -69,8 +68,6 @@ main{max-width:860px;margin:0 auto;padding:1.1rem 1rem 6rem;display:flex;
 .card::before{content:"";position:absolute;left:0;top:14%;bottom:14%;width:3px;
   border-radius:3px;background:linear-gradient(180deg,var(--accent),var(--accent-2))}
 .meta{display:flex;align-items:center;gap:.5rem;margin-bottom:.45rem;flex-wrap:wrap}
-.meta .mstats{margin-left:auto;font-size:.62rem;color:var(--text-dim);
-  font-family:ui-monospace,Consolas,monospace}
 .pill{font-size:.68rem;padding:.14rem .55rem;border-radius:99px;color:var(--accent);
   background:rgba(76,201,240,.10);border:1px solid rgba(76,201,240,.28)}
 .pill.src{color:#fbbf24;background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.25)}
@@ -158,7 +155,6 @@ select:focus,input[type=text]:focus{border-color:var(--accent)}
   <div class="logo"></div>
   <h1>reSpeaker 实时双语字幕</h1>
   <div class="spacer"></div>
-  <span id="latency" title="端到端延迟"></span>
   <span id="gate">--</span>
   <div id="dot" title="连接状态"></div>
   <button id="gear" title="设置">
@@ -230,8 +226,7 @@ function cardFor(id, partial){
     // streaming phase: blinking cursor, no translation placeholder yet
     // (the old version showed "翻译中…" only after the final text froze)
     el.innerHTML =
-      '<div class="meta"><span class="pill src">partial</span>' +
-      '<span class="mstats"></span></div>' +
+      '<div class="meta"><span class="pill src">partial</span></div>' +
       '<div class="src-text"></div>' +
       (partial ? '<span class="cursor"></span>' : '') +
       '<div class="trans"></div>';
@@ -246,49 +241,10 @@ function cardFor(id, partial){
   return el;
 }
 
-// ---- typewriter reveal: partials arrive in bursts (one per ~600ms decode
-// chunk); reveal the new characters one by one so text appears char-by-char
-// while the cursor blinks, instead of jumping in word-sized blocks.
-function stopType(el){
-  if (el._typeT){ clearTimeout(el._typeT); el._typeT = null; }
-}
-function syncType(el){
-  const target = el._target || "";
-  const shown = Math.min(el._shown || 0, target.length);
-  el._shown = shown;
-  const txt = el.querySelector(".src-text");
-  if (txt) txt.textContent = target.slice(0, shown);
-  let cur = el.querySelector(".cursor");
-  if (cur && cur.previousSibling !== txt){
-    cur.remove();
-    cur = null;
-  }
-  if (!cur && txt && txt.parentNode){
-    cur = document.createElement("span");
-    cur.className = "cursor";
-    txt.parentNode.insertBefore(cur, txt.nextSibling);
-  }
-}
-function pumpType(el){
-  if (el._typeT) return;
-  const step = () => {
-    el._typeT = null;
-    const target = el._target || "";
-    const shown = el._shown || 0;
-    if (shown >= target.length) return;
-    el._shown = shown + 1;
-    syncType(el);
-    scrollIfStuck();
-    const remain = target.length - el._shown;
-    // pace to finish the backlog before the next burst (~600ms away)
-    const delay = Math.max(30, Math.min(95, Math.round(500 / Math.max(1, remain))));
-    el._typeT = setTimeout(step, delay);
-  };
-  el._typeT = setTimeout(step, 35);
-}
-
+// freezeCard: the utterance is complete - drop the blinking cursor and make
+// sure the translation slot shows the pending placeholder. Called for the
+// 2-pass final result, which replaces pass-1 streaming text in one shot.
 function freezeCard(el, lang){
-  stopType(el);
   const cur = el.querySelector(".cursor");
   if (cur) cur.remove();
   const trans = el.querySelector(".trans");
@@ -306,43 +262,33 @@ function handle(msg){
     case "source": {
       removeEmpty();
       const el = cardFor(msg.id);
-      stopType(el);
-      el._target = msg.text || "";
-      el._shown = el._target.length;
       freezeCard(el, msg.lang);
       el.querySelector(".src-text").textContent = msg.text || "";
-      if (msg.latency_ms){
-        const s = el.querySelector(".mstats");
-        if (s) s.textContent = "asr " + msg.latency_ms + "ms";
-      }
       scrollIfStuck();
       break;
     }
     case "final": {
       removeEmpty();
       const el = cardFor(msg.id);
-      stopType(el);
-      el._target = msg.text || "";
-      el._shown = el._target.length;
       freezeCard(el, msg.lang);
       el.querySelector(".src-text").textContent = msg.text || "";
-      if (msg.latency_ms){
-        const s = el.querySelector(".mstats");
-        if (s) s.textContent = "asr " + msg.latency_ms + "ms";
-      }
       scrollIfStuck();
       break;
     }
     case "partial": {
       removeEmpty();
+      // 2-pass pass 1: paint the streaming text the instant it arrives.
+      // The backend sends the *cumulative* transcript, so each message
+      // replaces the whole line - there is no append and no reveal
+      // animation, the card simply grows by one decode step.
       const el = cardFor(msg.id, true);
-      el._target = msg.text || "";
-      pumpType(el);
+      el.querySelector(".src-text").textContent = msg.text || "";
+      scrollIfStuck();
       break;
     }
     case "discard": {
       const el = cards.get(msg.id);
-      if (el){ stopType(el); el.remove(); cards.delete(msg.id); }
+      if (el){ el.remove(); cards.delete(msg.id); }
       if (!cards.size) stream.appendChild(empty);
       break;
     }
@@ -361,17 +307,6 @@ function handle(msg){
       $("gate").textContent = (msg.gate_mode || "--") +
         (msg.hw_vad ? " · 说" : " · 静");
       break;
-    case "latency.update": {
-      $("latency").textContent =
-        "e2e " + (msg.e2e_ms / 1000).toFixed(2) + "s";
-      const el = cards.get(msg.id);
-      if (el){
-        const s = el.querySelector(".mstats");
-        if (s) s.textContent =
-          "asr " + msg.asr_ms + "ms · tr " + msg.trans_ms + "ms";
-      }
-      break;
-    }
     case "cmd_result":
       if (msg.ok === false) toast("命令失败: " + (msg.error || ""), "err");
       break;
