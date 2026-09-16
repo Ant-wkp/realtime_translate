@@ -1,0 +1,2 @@
+# reSpeaker XVF3800 USB access for non-root users
+SUBSYSTEM=="usb", ATTRS{idVendor}=="20f1", ATTRS{idProduct}=="0030", MODE="0666", TAG+="uaccess"

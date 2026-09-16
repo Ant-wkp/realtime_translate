@@ -1,0 +1,13 @@
+numpy
+sounddevice
+websockets
+silero-vad
+onnxruntime
+ctranslate2
+sentencepiece
+pyusb
+faster-whisper
+funasr
+modelscope
+torch
+torchaudio
