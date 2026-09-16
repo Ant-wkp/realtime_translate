@@ -19,14 +19,21 @@ from .asr import AsrProvider, AsrResult
 @dataclass
 class _Utterance:
     stream_id: str
-    chunks: list = field(default_factory=list)
-    partial_parts: list = field(default_factory=list)
+    chunks: list = field(default_factory=list)          # full audio (for final re-decode)
+    pend: list = field(default_factory=list)            # samples waiting for the next 600ms decode
+    cache: dict = field(default_factory=dict)           # streaming state, persists across chunks
+    partial_parts: list = field(default_factory=list)   # accumulated partial text
     aborted: bool = False
 
 
 class FunasrProvider(AsrProvider):
     name = "funasr"
     supports_streaming = True
+
+    STREAM_CHUNK_MS = 600   # decode one streaming chunk every ~600ms
+    # FunASR chunk_size units are 60ms frames: [5, 10, 5] =
+    # 300ms left context, 600ms center, 300ms right context
+    CHUNK_SIZE = [5, 10, 5]
 
     def __init__(self, sample_rate: int = 16000):
         from funasr import AutoModel
@@ -44,7 +51,7 @@ class FunasrProvider(AsrProvider):
     # ------------------------------------------------------------------
     def transcribe(self, audio: np.ndarray) -> AsrResult:
         start = time.monotonic()
-        res = self._offline.generate(input=audio, batch_size_s=300)
+        res = self._offline.generate(input=audio, batch_size_s=300, disable_pbar=True)
         text = res[0].get("text", "") if res else ""
         text = self._add_punc(text)
         return AsrResult(
@@ -57,7 +64,7 @@ class FunasrProvider(AsrProvider):
     def _add_punc(self, text: str) -> str:
         if not text:
             return text
-        res = self._punc.generate(input=text)
+        res = self._punc.generate(input=text, disable_pbar=True)
         return res[0].get("text", text) if res else text
 
     # ------------------------------------------------------------------
@@ -70,31 +77,73 @@ class FunasrProvider(AsrProvider):
         utt = self._utts.get(stream_id)
         if utt is None or utt.aborted:
             return ""
-        utt.chunks.append(np.asarray(audio, dtype=np.float32))
+        audio = np.asarray(audio, dtype=np.float32)
+        utt.chunks.append(audio)
         if self._stream is None:
             return "".join(utt.partial_parts)
 
-        chunk_ms = max(int(audio.size / 16), 600)  # >=600ms per streaming chunk
+        # accumulate samples until a full streaming chunk is ready; decoding
+        # every 100ms tick would thrash the model and spam rtf progress bars
+        utt.pend.append(audio)
+        pend = np.concatenate(utt.pend) if utt.pend else np.zeros(0, np.float32)
+        if pend.size < self.STREAM_CHUNK_MS * 16:
+            return "".join(utt.partial_parts)
+        utt.pend = []
+
         res = self._stream.generate(
-            input=audio,
-            cache={},
+            input=pend,
+            cache=utt.cache,            # state persists across chunks
             is_final=False,
-            chunk_size=[0, chunk_ms, 600],
+            chunk_size=self.CHUNK_SIZE,
+            disable_pbar=True,
         )
         delta = res[0].get("text", "") if res else ""
         if delta:
             utt.partial_parts.append(delta)
         return "".join(utt.partial_parts)
 
-    def finish(self, stream_id: str) -> AsrResult:
+    def finish_online(self, stream_id: str) -> tuple[str, np.ndarray]:
+        """Close the online pass only: flush the decoder tail with
+        is_final=True, return (full partial text, whole utterance audio).
+
+        Split out from the offline re-decode so the streaming worker is
+        never blocked by a multi-second second-pass decode: the caller can
+        broadcast the tail partial immediately and re-decode on another
+        thread via transcribe().
+        """
         utt = self._utts.pop(stream_id, None)
-        if utt is None:
-            return AsrResult(text="", language="zh", stream_id=stream_id)
-        start = time.monotonic()
+        if utt is None or utt.aborted:
+            return "", np.zeros(0, dtype=np.float32)
+        if self._stream is not None and utt.pend:
+            try:
+                res = self._stream.generate(
+                    input=np.concatenate(utt.pend),
+                    cache=utt.cache,
+                    is_final=True,
+                    chunk_size=self.CHUNK_SIZE,
+                    disable_pbar=True,
+                )
+                delta = res[0].get("text", "") if res else ""
+                if delta:
+                    utt.partial_parts.append(delta)
+            except Exception:  # noqa: BLE001 - tail pass is best-effort
+                pass
+            utt.pend = []
         audio = (
-            np.concatenate(utt.chunks) if utt.chunks else np.zeros(0, dtype=np.float32)
+            np.concatenate(utt.chunks) if utt.chunks
+            else np.zeros(0, dtype=np.float32)
         )
-        res = self._offline.generate(input=audio, batch_size_s=300)
+        return "".join(utt.partial_parts), audio
+
+    def finish(self, stream_id: str) -> AsrResult:
+        """Single-thread finish: online tail + offline re-decode inline.
+
+        Kept for compatibility (tests, non-streaming callers); the live
+        pipeline uses finish_online + transcribe on a separate thread.
+        """
+        partial, audio = self.finish_online(stream_id)
+        start = time.monotonic()
+        res = self._offline.generate(input=audio, batch_size_s=300, disable_pbar=True)
         text = res[0].get("text", "") if res else ""
         text = self._add_punc(text)
         return AsrResult(
@@ -105,7 +154,7 @@ class FunasrProvider(AsrProvider):
             meta={
                 "engine": self.name,
                 "mode": "2pass-final",
-                "partial_hint": "".join(utt.partial_parts),
+                "partial_hint": partial,
             },
         )
 

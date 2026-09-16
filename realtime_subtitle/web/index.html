@@ -79,6 +79,10 @@ main{max-width:860px;margin:0 auto;padding:1.1rem 1rem 6rem;display:flex;
   font-size:.98rem;line-height:1.5;color:var(--accent)}
 .trans.pending{color:var(--text-dim);animation:shimmer 1.6s ease-in-out infinite}
 @keyframes shimmer{0%,100%{opacity:.55}50%{opacity:.95}}
+.cursor{display:inline-block;width:.55em;height:1.05em;margin-left:.15em;
+  vertical-align:-0.15em;background:var(--accent);
+  animation:blink 1s steps(1) infinite;border-radius:2px}
+@keyframes blink{0%,55%{opacity:1}56%,100%{opacity:0}}
 .trans .lang{font-size:.66rem;font-family:ui-monospace,Consolas,monospace;
   color:var(--text-dim);margin-left:.4rem}
 /* drawer */
@@ -218,16 +222,19 @@ function scrollIfStuck(){
 function removeEmpty(){
   if (empty && empty.parentNode) empty.remove();
 }
-function cardFor(id){
+function cardFor(id, partial){
     let el = cards.get(id);
   if (!el){
     el = document.createElement("div");
     el.className = "card";
+    // streaming phase: blinking cursor, no translation placeholder yet
+    // (the old version showed "翻译中…" only after the final text froze)
     el.innerHTML =
       '<div class="meta"><span class="pill src">partial</span>' +
       '<span class="mstats"></span></div>' +
       '<div class="src-text"></div>' +
-      '<div class="trans pending">翻译中…</div>';
+      (partial ? '<span class="cursor"></span>' : '') +
+      '<div class="trans"></div>';
     stream.appendChild(el);
     cards.set(id, el);
     if (cards.size > MAX_CARDS){
@@ -239,16 +246,38 @@ function cardFor(id){
   return el;
 }
 
+function freezeCard(el, lang){
+  const cur = el.querySelector(".cursor");
+  if (cur) cur.remove();
+  const trans = el.querySelector(".trans");
+  if (trans && !trans.textContent){
+    trans.className = "trans pending";
+    trans.textContent = "翻译中…";
+  }
+  const pill = el.querySelector(".pill");
+  pill.textContent = (lang === "zh" ? "中→" : "外→") + (lang || "?");
+  pill.className = "pill";
+}
+
 function handle(msg){
   switch (msg.type){
-    case "source":
+    case "source": {
       removeEmpty();
-    case "final": {
       const el = cardFor(msg.id);
+      freezeCard(el, msg.lang);
       el.querySelector(".src-text").textContent = msg.text || "";
-      const pill = el.querySelector(".pill");
-      pill.textContent = (msg.lang === "zh" ? "中→" : "外→") + (msg.lang || "?");
-      pill.className = "pill";
+      if (msg.latency_ms){
+        const s = el.querySelector(".mstats");
+        if (s) s.textContent = "asr " + msg.latency_ms + "ms";
+      }
+      scrollIfStuck();
+      break;
+    }
+    case "final": {
+      removeEmpty();
+      const el = cardFor(msg.id);
+      freezeCard(el, msg.lang);
+      el.querySelector(".src-text").textContent = msg.text || "";
       if (msg.latency_ms){
         const s = el.querySelector(".mstats");
         if (s) s.textContent = "asr " + msg.latency_ms + "ms";
@@ -258,8 +287,15 @@ function handle(msg){
     }
     case "partial": {
       removeEmpty();
-      const el = cardFor(msg.id);
-      el.querySelector(".src-text").textContent = msg.text || "";
+      const el = cardFor(msg.id, true);
+      let txt = el.querySelector(".src-text");
+      let cur = el.querySelector(".cursor");
+      // keep the cursor after the text (re-append if it exists)
+      txt.textContent = msg.text || "";
+      if (cur && cur.parentNode) cur.remove();
+      cur = document.createElement("span");
+      cur.className = "cursor";
+      txt.parentNode.insertBefore(cur, txt.nextSibling);
       scrollIfStuck();
       break;
     }

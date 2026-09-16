@@ -27,12 +27,29 @@ class Task:
     meta: dict = field(default_factory=dict)
 
 
+@dataclass
+class FinalRequest:
+    """Closed utterance awaiting the offline second-pass re-decode.
+
+    Produced by the streaming worker (online tail is already broadcast);
+    consumed by FinalDecodeThread so the multi-second offline decode never
+    blocks the next utterance's streaming feed queue.
+    """
+    task_id: str
+    stream_id: str
+    audio: object
+    partial_hint: str = ""
+    doa: str = ""
+
+
 class TranscriberWorker(threading.Thread):
-    def __init__(self, provider: AsrProvider, on_result=None, on_partial=None):
+    def __init__(self, provider: AsrProvider, on_result=None, on_partial=None,
+                 on_final_request=None):
         super().__init__(daemon=True, name="TranscriberWorker")
         self.provider = provider
         self.on_result = on_result
         self.on_partial = on_partial
+        self.on_final_request = on_final_request
         self._task_queue: queue.Queue = queue.Queue()
         self._stop_evt = threading.Event()
 
@@ -42,6 +59,12 @@ class TranscriberWorker(threading.Thread):
         self._task_queue.put(
             Task(audio=audio, task_id=task_id, doa=doa, stream_id=stream_id,
                  kind="transcribe", meta=meta or {})
+        )
+
+    def stream_start(self, stream_id: str) -> None:
+        """Open a streaming utterance session on the worker thread."""
+        self._task_queue.put(
+            Task(audio=None, task_id=stream_id, kind="start", stream_id=stream_id)
         )
 
     def stream_feed(self, stream_id: str, audio, task_id: str) -> None:
@@ -74,6 +97,10 @@ class TranscriberWorker(threading.Thread):
 
     def _handle(self, task: Task) -> None:
         try:
+            if task.kind == "start":
+                if hasattr(self.provider, "start_utt"):
+                    self.provider.start_utt(task.stream_id)
+                return
             if task.kind == "abort":
                 self.provider.abort(task.stream_id)
                 return
@@ -83,6 +110,22 @@ class TranscriberWorker(threading.Thread):
                     self.on_partial(task.stream_id, partial)
                 return
             if task.kind == "finish":
+                # online tail only: broadcast the last partial immediately,
+                # then hand the audio to the offline re-decode thread so the
+                # next utterance's feeds are never blocked by a 1s+ decode
+                if hasattr(self.provider, "finish_online"):
+                    partial, audio = self.provider.finish_online(task.stream_id)
+                    if partial and self.on_partial:
+                        self.on_partial(task.stream_id, partial)
+                    if self.on_final_request is not None:
+                        self.on_final_request(FinalRequest(
+                            task_id=task.task_id,
+                            stream_id=task.stream_id,
+                            audio=audio,
+                            partial_hint=partial,
+                            doa=task.doa,
+                        ))
+                    return
                 result = self.provider.finish(task.stream_id)
                 result.meta["final_replaces_partial"] = True
                 self._emit(result, task)

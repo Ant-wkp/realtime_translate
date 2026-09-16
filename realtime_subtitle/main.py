@@ -36,6 +36,8 @@ if __package__ is None or __package__ == "":
         sys.path.insert(0, _repo_root)
     __package__ = "realtime_subtitle"
 
+from .asr import AsrResult
+
 # avoid XET download failures with huggingface_hub
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
@@ -133,6 +135,57 @@ class TranslationThread(threading.Thread):
                     })
             except Exception as exc:  # noqa: BLE001
                 print(f"[NLLB] translate failed: {exc}")
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+class FinalDecodeThread(threading.Thread):
+    """Offline second-pass re-decode, decoupled from the streaming worker.
+
+    In 2-pass mode the offline model re-decodes the whole utterance (~1s for
+    a long sentence). Running that on the ASR worker would stall the next
+    utterance's feed queue and delay its first partial by the decode time.
+    This thread keeps the streaming worker free: online partials keep
+    flowing while the final text is being reconstructed.
+    """
+
+    def __init__(self, provider, on_result):
+        super().__init__(daemon=True, name="FinalDecodeThread")
+        self.provider = provider
+        self.on_result = on_result
+        self.job_queue: queue.Queue = queue.Queue()
+        self._stop = threading.Event()
+
+    def submit(self, task_id: str, audio, doa: str = "", partial_hint: str = "") -> None:
+        self.job_queue.put({"task_id": task_id, "audio": audio,
+                            "doa": doa, "partial_hint": partial_hint})
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                job = self.job_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            start = time.monotonic()
+            try:
+                res = self.provider.transcribe(job["audio"])
+                result = AsrResult(
+                    text=res.text,
+                    language=res.language,
+                    latency=time.monotonic() - start,
+                    meta={
+                        "engine": self.provider.name,
+                        "mode": "2pass-final",
+                        "task_id": job["task_id"],
+                        "doa": job["doa"],
+                        "final_replaces_partial": True,
+                        "partial_hint": job["partial_hint"],
+                    },
+                )
+                self.on_result(result)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[ASR] final decode {job['task_id']} failed: {exc}")
 
     def stop(self) -> None:
         self._stop.set()
@@ -314,8 +367,16 @@ def main(argv=None) -> int:
 
     from .transcriber import TranscriberWorker
 
+    final_decode = FinalDecodeThread(provider, on_result=on_asr_result)
+    final_decode.start()
+
+    def on_final_request(req):
+        final_decode.submit(req.task_id, req.audio, doa=req.doa,
+                            partial_hint=req.partial_hint)
+
     transcriber = TranscriberWorker(provider, on_result=on_asr_result,
-                                    on_partial=on_partial)
+                                    on_partial=on_partial,
+                                    on_final_request=on_final_request)
     transcriber.start()
 
     vad_reader = None
@@ -432,7 +493,7 @@ def main(argv=None) -> int:
             return
 
         if was_stream and seg_id:
-            transcriber.stream_finish(seg_id, doa=locator.mode())
+            transcriber.stream_finish(seg_id, task_id=seg_id, doa=locator.mode())
         else:
             transcriber.submit(audio, task_id=seg_id, doa=locator.mode())
         # reset for next segment (without discarding this one)
@@ -505,6 +566,14 @@ def main(argv=None) -> int:
                         pre_roll.append(c)
                     else:
                         pass
+                # streaming: one merged feed per tick (100ms) instead of
+                # one task per callback block - the worker queue drains
+                # 3-4x fewer tasks and partials surface earlier
+                if speaking and stream_opened and chunks:
+                    transcriber.stream_feed(
+                        current_id,
+                        np.concatenate(chunks) if len(chunks) > 1 else chunks[0],
+                        current_id)
                 if not speaking and pre_roll and gate:
                     pass  # merged at segment open below
 
@@ -519,6 +588,7 @@ def main(argv=None) -> int:
                             utterance = list(pre_roll)
                             pre_roll = []
                         if args.streaming and provider.supports_streaming:
+                            transcriber.stream_start(current_id)
                             transcriber.stream_feed(current_id, np.concatenate(utterance) if utterance else np.zeros(0, np.float32), current_id)
                             stream_opened = True
                         print(f"[seg] open {current_id}")
@@ -539,7 +609,16 @@ def main(argv=None) -> int:
 
                     silence = now - last_speech_at
                     overlong = now - seg_start >= args.max_seconds
-                    if silence >= args.silence_hold or overlong:
+                    # fast-cut: Silero confirms the silence earlier than the
+                    # fixed hold - once the trailing silence exceeds 0.25s
+                    # and the current frame is clearly non-speech, the
+                    # utterance is over; no need to wait the full 0.6s hold
+                    fast_cut = (
+                        speaking
+                        and silence > 0.25
+                        and sw_prob < 0.2
+                    )
+                    if silence >= args.silence_hold or overlong or fast_cut:
                         seg_id_before_flush = current_id
                         print(f"[seg] flush after {now - seg_start:.2f}s")
                         flush_segment()
@@ -602,6 +681,7 @@ def main(argv=None) -> int:
         if vad_reader:
             vad_reader.stop()
         transcriber.stop()
+        final_decode.stop()
         translation.stop()
         server.stop()
         provider.close()
