@@ -198,8 +198,15 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description="reSpeaker real-time bilingual subtitles")
     p.add_argument("--asr", choices=["funasr", "whisper"], default="funasr")
     p.add_argument("--model", default="tiny", help="whisper model size")
-    p.add_argument("--streaming", action="store_true",
-                   help="FunASR streaming 2-pass with partial results")
+    # Streaming 2-pass is the default: partials are what make subtitles feel
+    # live, so it takes --no-streaming to opt out rather than a flag to opt in.
+    p.add_argument("--streaming", dest="streaming", action="store_true", default=True,
+                   help="FunASR streaming 2-pass with partial results (default)")
+    p.add_argument("--no-streaming", dest="streaming", action="store_false",
+                   help="disable streaming: decode whole segments offline only")
+    p.add_argument("--asr-chunk-size", choices=["480", "600"], default="480",
+                   help="streaming decode stride: 480ms (default, lower latency) "
+                        "or 600ms (upstream default, longer lookahead)")
     p.add_argument("--vad-gate", choices=["hw", "and", "confirm"], default="and")
     p.add_argument("--audio-source", default="conference",
                    choices=["conference", "asr", "mic0", "mic1", "mic2", "mic3"])
@@ -318,9 +325,15 @@ def main(argv=None) -> int:
     if args.asr == "funasr":
         from .funasr_provider import FunasrProvider
 
-        provider = FunasrProvider()
-        print("[ASR] FunASR Paraformer (zh, streaming 2pass)" if args.streaming
-              else "[ASR] FunASR Paraformer (zh, offline)")
+        chunk = (FunasrProvider.CHUNK_SIZE_480 if args.asr_chunk_size == "480"
+                 else FunasrProvider.CHUNK_SIZE_600)
+        provider = FunasrProvider(chunk_size=chunk)
+        if args.streaming:
+            stride_ms = chunk[1] * 60
+            print(f"[ASR] FunASR Paraformer (zh, streaming 2pass, "
+                  f"stride {stride_ms}ms)")
+        else:
+            print("[ASR] FunASR Paraformer (zh, offline)")
     else:
         from .whisper_provider import WhisperProvider
 
