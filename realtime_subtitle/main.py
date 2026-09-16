@@ -210,7 +210,7 @@ def main(argv=None) -> int:
         router = BeamRouter(device)
         recon = router.recon()
         info = router.describe(recon["op_all"])
-        print(f"[beam] OP_ALL={recon['op_all']}")
+        print(f"[beam] AUDIO_MGR_OP_ALL={recon['op_all']}")
         print(f"[beam] describe={info}")
         if args.beam_select:
             if not info.get("ok"):

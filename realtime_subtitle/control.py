@@ -8,7 +8,7 @@ operations return explicit errors instead of silent fallbacks.
 
 from __future__ import annotations
 
-from .usb_device import PARAMETERS
+from .usb_device import PARAMETERS, RESID_GROUPS
 
 
 class ControlHandler:
@@ -32,11 +32,12 @@ class ControlHandler:
     # device parameters ---------------------------------------------------
     def cmd_list_commands(self, _payload) -> dict:
         groups = {}
-        for name, (code, ptype, ro, rw) in PARAMETERS.items():
-            resid = name.split("_")[0].lower()
-            groups.setdefault(resid, []).append(
-                {"name": name, "code": code, "type": ptype,
-                 "access": "rw" if rw else "ro"}
+        for name, (resid, cmdid, count, access, ptype, desc) in PARAMETERS.items():
+            gname = RESID_GROUPS.get(resid, f"resid_{resid}")
+            groups.setdefault(gname, []).append(
+                {"name": name, "resid": resid, "cmdid": cmdid,
+                 "count": count, "type": ptype, "access": access,
+                 "description": desc}
             )
         return {"groups": groups}
 
@@ -55,8 +56,7 @@ class ControlHandler:
         value = payload.get("value")
         if name not in PARAMETERS:
             raise ValueError(f"unknown parameter: {name}")
-        _, _, _, rw = PARAMETERS[name]
-        if not rw:
+        if PARAMETERS[name][3] == "ro":
             raise ValueError(f"{name} is read-only")
         if value is None:
             raise ValueError("value required")
