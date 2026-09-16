@@ -167,15 +167,30 @@ def parse_args(argv=None):
 
 
 def resolve_input_device(name: str | None) -> int:
+    """Pick the input device: explicit name match, else the XVF3800 array
+    (this program's expected hardware), else the system default."""
     import sounddevice as sd
 
-    if name is None:
-        return sd.default.device[0]
     devs = [d for d in sd.query_devices() if d["max_input_channels"] > 0]
+    if name is not None:
+        for d in devs:
+            if name.lower() in d["name"].lower():
+                return d["index"]
+        raise RuntimeError(f"input device not found: {name}")
+    # auto-detect the reSpeaker XVF3800 audio interface
     for d in devs:
-        if name.lower() in d["name"].lower():
+        if "xvf3800" in d["name"].lower() or "reSpeaker XVF3800" in d["name"]:
             return d["index"]
-    raise RuntimeError(f"input device not found: {name}")
+    # hardware not found: fall back to the default device but say so
+    default = sd.default.device[0]
+    fallback_name = "default"
+    for d in devs:
+        if d["index"] == default:
+            fallback_name = d["name"]
+            break
+    print(f"[audio] WARNING: reSpeaker XVF3800 not detected, using default "
+          f"input '{fallback_name}' (pass --device <name> to override)")
+    return default
 
 
 def resolve_audio_channel(args, in_channels: int) -> tuple[int, str]:
