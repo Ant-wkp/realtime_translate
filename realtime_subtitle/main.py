@@ -47,7 +47,12 @@ SAMPLE_RATE = 16000
 # default segmentation parameters
 VAD_INTERVAL = 0.1          # main loop tick, seconds
 SILENCE_HOLD = 0.6          # trailing silence before flush
-MIN_SECONDS = 0.5           # shortest valid segment
+# Shortest valid segment, measured as *voiced* time. This number has to be
+# interpreted against real speech only: the trailing-silence hold runs for a
+# full silence_hold and used to be counted into duration, which inflated every
+# segment by ~0.6s and let the filter pass near-silence. With duration now
+# honest, 0.5 would reject ordinary two-character replies, so it is 0.3.
+MIN_SECONDS = 0.3
 MAX_SECONDS = 20.0          # force-cut overlong segments
 PRE_ROLL_DEFAULT = 1.0      # ring-buffer window retained before segment start
 SW_FRAME_THRESHOLD = 0.5    # Silero per-frame speech threshold
@@ -461,7 +466,10 @@ def main(argv=None) -> int:
     silence_low_ticks = 0     # consecutive ticks with sw_prob < 0.2
     hw_speech_ticks = 0
     sw_speech_frames = 0
-    total_frames = 0            # counted only up to last_speech_at
+    total_frames = 0            # every sample seen while speaking
+    silent_tail_frames = 0      # ...of which these came after the last voiced tick
+    silent_tail_prob = 0.0      # probability mass of that silent tail
+    speech_samples = 0          # voiced samples only (pre-roll seed excluded)
     prob_sum = 0.0
     max_prob = 0.0
     current_id = ""
@@ -498,7 +506,8 @@ def main(argv=None) -> int:
         """Single discard path: abort stream, broadcast, reset, go idle."""
         nonlocal speaking, utterance, hw_speech_ticks, sw_speech_frames
         nonlocal total_frames, prob_sum, max_prob, current_id, stream_opened
-        nonlocal silence_low_ticks
+        nonlocal silence_low_ticks, speech_samples, pre_roll_samples
+        nonlocal silent_tail_frames, silent_tail_prob
         if stream_opened and current_id:
             transcriber.stream_abort(current_id)
         if current_id:
@@ -507,15 +516,21 @@ def main(argv=None) -> int:
             seg_seed_secs.pop(current_id, None)
             first_char_logged.discard(current_id)
         if args.debug_gate and current_id:
-            ratio = sw_speech_frames / total_frames if total_frames else 0.0
-            avg = prob_sum / total_frames if total_frames else 0.0
+            # same denominator the flush filter uses: frames up to the last
+            # voiced tick, so discarded and kept segments are comparable
+            denom = total_frames - silent_tail_frames
+            ratio = sw_speech_frames / denom if denom else 0.0
+            avg = (prob_sum - silent_tail_prob) / denom if denom else 0.0
             print(f"[VAD] discard {current_id} ({reason}): dur={audio_dur():.2f}s "
                   f"ratio={ratio:.2f} avg_prob={avg:.2f} max_prob={max_prob:.2f} "
-                  f"hw_ticks={hw_speech_ticks}/{total_frames * SAMPLE_RATE // 512 or 1}")
+                  f"hw_ticks={hw_speech_ticks}/{denom // 512 or 1}")
         utterance = []
         hw_speech_ticks = 0
         sw_speech_frames = 0
         total_frames = 0
+        silent_tail_frames = 0
+        silent_tail_prob = 0.0
+        speech_samples = 0
         prob_sum = 0.0
         max_prob = 0.0
         current_id = ""
@@ -528,15 +543,43 @@ def main(argv=None) -> int:
         sw_vad.reset()  # legal reset point: utterance truly ended
 
     def audio_dur() -> float:
-        return sum(c.size for c in utterance) / SAMPLE_RATE if utterance else 0.0
+        """Voiced length of the current segment (seed and trailing hold
+        excluded) - the same quantity the min-length filter judges."""
+        return speech_samples / SAMPLE_RATE
+
+    def pre_roll_push(chunk: np.ndarray) -> None:
+        """Append one audio block, evicting the oldest beyond the window."""
+        nonlocal pre_roll_samples
+        pre_roll.append(chunk)
+        pre_roll_samples += chunk.size
+        while pre_roll_samples > PRE_ROLL_SAMPLES_MAX and len(pre_roll) > 1:
+            pre_roll_samples -= pre_roll.popleft().size
+
+    def pre_roll_take() -> np.ndarray:
+        """Drain the window into one contiguous block (oldest first)."""
+        nonlocal pre_roll_samples
+        if not pre_roll:
+            return np.zeros(0, dtype=np.float32)
+        audio = np.concatenate(pre_roll) if len(pre_roll) > 1 else pre_roll[0]
+        pre_roll.clear()
+        pre_roll_samples = 0
+        return audio
 
     def flush_segment() -> None:
         nonlocal speaking, utterance, hw_speech_ticks, sw_speech_frames
         nonlocal total_frames, prob_sum, max_prob, current_id, stream_opened
-        nonlocal silence_low_ticks
+        nonlocal silence_low_ticks, speech_samples
+        nonlocal silent_tail_frames, silent_tail_prob
         audio = np.concatenate(utterance) if utterance else np.zeros(0, np.float32)
         utterance = []
-        duration = audio.size / SAMPLE_RATE
+        # duration drives the min-length filter, so it must reflect voiced
+        # audio only: the pre-roll seed is history rather than this utterance,
+        # and the hold period we just waited out is silence, not speech
+        duration = speech_samples / SAMPLE_RATE
+        # ratio denominator stops at the last voiced tick: a sentence followed
+        # by a long quiet tail must not be diluted into a discard
+        voiced_span_frames = total_frames - silent_tail_frames
+        voiced_prob = prob_sum - silent_tail_prob
         seg_id = current_id
         current_id = ""
         was_stream = stream_opened
@@ -547,8 +590,8 @@ def main(argv=None) -> int:
             discard_segment(f"duration {duration:.2f}s < min {args.min_seconds}s")
             return
         # level 2: speech ratio (denominator excludes trailing silence)
-        ratio = sw_speech_frames / total_frames if total_frames else 0.0
-        avg_prob = prob_sum / total_frames if total_frames else 0.0
+        ratio = sw_speech_frames / voiced_span_frames if voiced_span_frames else 0.0
+        avg_prob = voiced_prob / voiced_span_frames if voiced_span_frames else 0.0
         exempt = (duration < SHORT_EXEMPT_SECONDS
                   and max_prob >= SHORT_EXEMPT_MAX_PROB)
         if args.debug_gate:
@@ -571,6 +614,9 @@ def main(argv=None) -> int:
         hw_speech_ticks = 0
         sw_speech_frames = 0
         total_frames = 0
+        silent_tail_frames = 0
+        silent_tail_prob = 0.0
+        speech_samples = 0
         prob_sum = 0.0
         max_prob = 0.0
         speaking = False
@@ -674,14 +720,29 @@ def main(argv=None) -> int:
                     # accumulate statistics only while speech may be active
                     if chunks:
                         n = sum(c.size for c in chunks)
-                        # count frames only up to last speech for ratio denominator
+                        # Voiced time is counted only while the gate is open.
+                        # This branch also runs through the whole tail wait
+                        # (silence_hold), so counting every sample here would
+                        # inflate duration by ~0.6s and leave the min-length
+                        # filter and the short-speech exemption both judging
+                        # the wrong quantity.
                         if gate:
+                            speech_samples += n
                             sw_speech_frames += n
                             total_frames += n
+                            silent_tail_frames = 0
+                            silent_tail_prob = 0.0
                             last_speech_at = now
                         else:
+                            # held aside rather than dropped: silence between
+                            # words still belongs to the segment, silence
+                            # after the last word does not
                             total_frames += n
-                    prob_sum += sw_prob * (sum(c.size for c in chunks))
+                            silent_tail_frames += n
+                    tick_prob = sw_prob * (sum(c.size for c in chunks))
+                    prob_sum += tick_prob
+                    if not gate:
+                        silent_tail_prob += tick_prob
                     max_prob = max(max_prob, sw_prob)
                     hw_speech_ticks += 1 if hw_vad else 0
 
