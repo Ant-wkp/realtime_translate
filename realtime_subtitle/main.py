@@ -37,7 +37,7 @@ if __package__ is None or __package__ == "":
         sys.path.insert(0, _repo_root)
     __package__ = "realtime_subtitle"
 
-from .asr import AsrResult
+from .asr import AsrResult, detect_language
 
 # avoid XET download failures with huggingface_hub
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -828,15 +828,20 @@ def main(argv=None) -> int:
                             seg_txt = f" (段时长 {seg_len:.2f}s)" if seg_len else ""
                             print(f"[耗时] {task_id[:8]} 说完→原文上屏: "
                                   f"{src_e2e:.2f}s{seg_txt}")
+                    # The ASR engine's own `language` field describes what it
+                    # emits (FunASR always reports "zh"), not what it heard, so
+                    # the card label and the translation direction are both
+                    # derived from the recognized text instead.
+                    lang = detect_language(result.text)
                     server.broadcast({
                         "type": "final" if is_final else "source",
                         "id": task_id,
                         "ts": time.time(),
                         "doa": result.meta.get("doa", ""),
                         "text": result.text,
-                        "lang": result.language,
+                        "lang": lang,
                     })
-                    translation.submit(task_id, result.text, result.language)
+                    translation.submit(task_id, result.text, lang)
 
                 # heartbeat broadcast
                 server.broadcast({

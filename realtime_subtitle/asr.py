@@ -8,17 +8,32 @@ from dataclasses import dataclass, field
 import numpy as np
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+_KANA_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
+_HANGUL_RE = re.compile(r"[\uac00-\ud7af\u1100-\u11ff]")
 
 
 def detect_language(text: str) -> str:
-    """High-recall language routing: any CJK char means Chinese source.
+    """Script-based language routing for the translation direction.
 
-    Mixed sentences like 'the API response time is too slow' would be
-    misclassified by a ratio threshold, so presence (not proportion) decides.
+    Only scripts that a character class can decide on its own are named.
+    Kana and hangul are checked before CJK ideographs because Japanese mixes
+    both: a kana character is proof of Japanese, whereas kanji alone is not
+    proof of Chinese. Latin, Cyrillic and the rest fall back to "en", which
+    is the direction used for Latin-script input - telling French from German
+    needs a real language-ID model, not a regex.
+
+    Presence, not proportion, decides: a mixed sentence like "the API 响应时间
+    太慢" stays Chinese because it contains ideographs.
     """
     if not text:
         return "en"
-    return "zh" if _CJK_RE.search(text) else "en"
+    if _KANA_RE.search(text):
+        return "ja"
+    if _HANGUL_RE.search(text):
+        return "ko"
+    if _CJK_RE.search(text):
+        return "zh"
+    return "en"
 
 
 @dataclass

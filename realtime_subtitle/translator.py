@@ -22,8 +22,6 @@ from .asr import detect_language
 
 log = logging.getLogger(__name__)
 
-_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
-
 LANG_TO_NLLB = {
     "zh": "zho_Hans",
     "en": "eng_Latn",
@@ -49,6 +47,11 @@ TARGET_LANGS = {
     "de": "German",
     "es": "Spanish",
     "ru": "Russian",
+    "pt": "Portuguese",
+    "it": "Italian",
+    "ar": "Arabic",
+    "th": "Thai",
+    "vi": "Vietnamese",
 }
 
 MIN_TRANSLATE_CHARS = 2
@@ -115,9 +118,21 @@ class NllbCTranslate2Provider:
         self.other_to = other_to
 
     # ------------------------------------------------------------------
-    def resolve_direction(self, text: str, detected: str) -> tuple[str, str]:
-        """Return (source_token, target_token) or ("", "") to skip."""
-        source = detected or detect_language(text)
+    def resolve_direction(self, text: str, detected: str = "") -> tuple[str, str]:
+        """Return (source_token, target_token) or ("", "") to skip.
+
+        The source language comes from the recognized *text*, not from the ASR
+        engine. A Chinese-only engine (FunASR) reports language="zh" for every
+        utterance because that is the language it emits, not a judgement about
+        what it heard - trusting it routed English speech through the
+        Chinese-source branch, which is why "other language -> Chinese" had no
+        effect on English input.
+
+        Anything that is not Chinese is routed to `other_to`, so an
+        unidentifiable or unexpected source still translates instead of being
+        skipped.
+        """
+        source = detect_language(text) or detected or "zh"
         target = self.zh_to if source == "zh" else self.other_to
         if source == target:
             return "", ""
@@ -128,12 +143,12 @@ class NllbCTranslate2Provider:
             return "", ""
         return src_token, tgt_token
 
-    def translate(self, text: str, detected: str = "zh") -> tuple[str, str]:
+    def translate(self, text: str, detected: str = "") -> tuple[str, str]:
         """Translate one segment. Returns (translated_text, target_lang) or
         (source_text, source_lang) when translation is skipped."""
         text = (text or "").strip()
         if len(text) < MIN_TRANSLATE_CHARS:
-            return text, detected
+            return text, detected or detect_language(text)
 
         src_token, tgt_token = self.resolve_direction(text, detected)
         if not src_token:
@@ -157,7 +172,10 @@ class NllbCTranslate2Provider:
         if out_tokens and out_tokens[0] == tgt_token:
             out_tokens = out_tokens[1:]
         translated = self.sp.decode(out_tokens)
-        target_lang = "zh" if tgt_token == "zho_Hans" else tgt_token.split("_")[0]
+        # report the same short code the frontend configures with ("en", not
+        # "eng"), so the card label and the settings dropdown agree
+        target_lang = next((code for code, tok in LANG_TO_NLLB.items()
+                            if tok == tgt_token), tgt_token.split("_")[0])
         return translated, target_lang
 
     def close(self) -> None:  # pragma: no cover
