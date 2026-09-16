@@ -110,6 +110,7 @@ class TranslationThread(threading.Thread):
             try:
                 text, target = self.translator.translate(job["text"], job["lang"])
                 trans_ms = int((time.monotonic() - start) * 1000)
+                print(f"[tr] {job['task_id']} -> {target} in {trans_ms}ms: {text[:60]!r}")
                 self.server.broadcast({
                     "type": "translation",
                     "id": job["task_id"],
@@ -160,6 +161,8 @@ def parse_args(argv=None):
     p.add_argument("--beam-recon", action="store_true", help="read-only beam probe then exit")
     p.add_argument("--beam-select", action="store_true", help="apply beam route then exit")
     p.add_argument("--list-devices", action="store_true")
+    p.add_argument("--debug-gate", action="store_true",
+                   help="print per-tick gate inputs and every discard reason")
     return p.parse_args(argv)
 
 
@@ -353,7 +356,7 @@ def main(argv=None) -> int:
             return sw_prob >= SW_FRAME_THRESHOLD
         return False
 
-    def discard_segment() -> None:
+    def discard_segment(reason: str = "") -> None:
         """Single discard path: abort stream, broadcast, reset, go idle."""
         nonlocal speaking, utterance, hw_speech_ticks, sw_speech_frames
         nonlocal total_frames, prob_sum, max_prob, current_id, stream_opened
@@ -361,6 +364,12 @@ def main(argv=None) -> int:
             transcriber.stream_abort(current_id)
         if current_id:
             server.broadcast({"type": "discard", "id": current_id, "ts": time.time()})
+        if args.debug_gate and current_id:
+            ratio = sw_speech_frames / total_frames if total_frames else 0.0
+            avg = prob_sum / total_frames if total_frames else 0.0
+            print(f"[VAD] discard {current_id} ({reason}): dur={audio_dur():.2f}s "
+                  f"ratio={ratio:.2f} avg_prob={avg:.2f} max_prob={max_prob:.2f} "
+                  f"hw_ticks={hw_speech_ticks}/{total_frames * SAMPLE_RATE // 512 or 1}")
         utterance = []
         hw_speech_ticks = 0
         sw_speech_frames = 0
@@ -371,6 +380,9 @@ def main(argv=None) -> int:
         stream_opened = False
         speaking = False
         sw_vad.reset()  # legal reset point: utterance truly ended
+
+    def audio_dur() -> float:
+        return sum(c.size for c in utterance) / SAMPLE_RATE if utterance else 0.0
 
     def flush_segment() -> None:
         nonlocal speaking, utterance, hw_speech_ticks, sw_speech_frames
@@ -385,20 +397,23 @@ def main(argv=None) -> int:
 
         # level 1: duration
         if duration < args.min_seconds:
-            discard_segment()
+            discard_segment(f"duration {duration:.2f}s < min {args.min_seconds}s")
             return
         # level 2: speech ratio (denominator excludes trailing silence)
         ratio = sw_speech_frames / total_frames if total_frames else 0.0
         avg_prob = prob_sum / total_frames if total_frames else 0.0
         exempt = (duration < SHORT_EXEMPT_SECONDS
                   and max_prob >= SHORT_EXEMPT_MAX_PROB)
+        if args.debug_gate:
+            print(f"[flush] dur={duration:.2f}s ratio={ratio:.2f} avg_prob={avg_prob:.2f} "
+                  f"max_prob={max_prob:.2f} exempt={exempt} hw_ticks={hw_speech_ticks}")
         if ratio < RATIO_THRESHOLD and not exempt:
-            discard_segment()
+            discard_segment(f"ratio {ratio:.2f} < {RATIO_THRESHOLD} (avg_prob={avg_prob:.2f})")
             return
         # level 3: energy (trim trailing silence, then floor RMS)
         audio = _trim_tail(audio)
         if audio.size and float(np.sqrt(np.mean(audio ** 2))) < np.sqrt(TRIM_TAIL_ENERGY):
-            discard_segment()
+            discard_segment(f"energy {float(np.sqrt(np.mean(audio ** 2)))**2:.2e} < {TRIM_TAIL_ENERGY:.2e}")
             return
 
         if was_stream and seg_id:
@@ -462,6 +477,10 @@ def main(argv=None) -> int:
 
                 gate = gate_open(hw_vad, sw_prob)
                 frame_now = int(now * 1000)
+
+                if args.debug_gate and (hw_vad or sw_prob >= 0.05 or speaking):
+                    print(f"[gate] hw={hw_vad} sw={sw_prob:.3f} gate={gate} "
+                          f"state={'SPK' if speaking else 'IDLE'} doa={doa_last}")
 
                 # 4) route audio (three destinations)
                 for c in chunks:
@@ -536,6 +555,9 @@ def main(argv=None) -> int:
                     if not result.text:
                         continue
                     is_final = bool(result.meta.get("final_replaces_partial"))
+                    if args.debug_gate:
+                        print(f"[asr] {task_id} final={is_final} lang={result.language} "
+                              f"lat={result.latency:.2f}s text={result.text[:60]!r}")
                     server.broadcast({
                         "type": "final" if is_final else "source",
                         "id": task_id,

@@ -1,9 +1,12 @@
 """Software VAD gating layer (Silero) cascaded with the hardware VAD.
 
-Silero VAD v5 runs ONNX-first with JIT fallback, frames audio in fixed
+Silero VAD runs on the torch JIT model (official silero-vad package
+preferred, local silero_vad.jit fallback), frames audio in fixed
 512-sample chunks with a carry buffer so block sizes from the audio callback
 need not align, and only resets internal RNN state when an utterance has
 truly ended (never on segment start, which would cold-start the model).
+The v5 ONNX export is intentionally not used: it misreports speech
+probability (~0.001 on real speech).
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ class SoftwareVad:
 
 
 class SileroVad(SoftwareVad):
-    """Silero VAD v5 wrapper: ONNX runtime first, torch JIT fallback.
+    """Silero VAD wrapper on the torch JIT backend.
 
     Frames are always 512 samples (32 ms @ 16 kHz). Leftover samples are kept
     in a carry buffer and prepended to the next block so callers can push
@@ -48,8 +51,6 @@ class SileroVad(SoftwareVad):
         self._carry = np.zeros(0, dtype=np.float32)
         self._last_prob = 0.0
         self._model = None
-        self._backend = None
-        self._ctx = None  # ONNX inference session state or torch RNN state
         self._load()
 
     # ------------------------------------------------------------------
@@ -59,44 +60,31 @@ class SileroVad(SoftwareVad):
         here = os.path.dirname(os.path.abspath(__file__))
         # script mode (python main.py) runs with CWD = package dir, module
         # mode runs from the repo root - try both, plus plain CWD.
-        model_paths = [
-            os.path.join(here, "silero_vad.onnx"),
-            "silero_vad.onnx",
+        jit_paths = [
             os.path.join(here, "silero_vad.jit"),
             "silero_vad.jit",
         ]
+        # 1) official pip package (silero-vad) - preferred, ships the
+        #    correct torch jit model
         try:
-            import onnxruntime as ort
+            from silero_vad import load_silero_vad
 
-            for path in model_paths:
-                if os.path.isfile(path):
-                    self._model = ort.InferenceSession(
-                        path, providers=["CPUExecutionProvider"]
-                    )
-                    self._backend = "onnx"
-                    break
-            if self._model is not None:
-                self.reset()
-                return
+            self._model = load_silero_vad()
+            self.reset()
+            return
         except ImportError:
             pass
-        try:
-            import torch
+        # 2) local torch jit file
+        import torch
 
-            self._torch = torch
-            for path in model_paths:
-                if os.path.isfile(path):
-                    self._model = torch.jit.load(path)
-                    self._backend = "jit"
-                    break
-            if self._model is not None:
+        for path in jit_paths:
+            if os.path.isfile(path):
+                self._model = torch.jit.load(path)
                 self.reset()
                 return
-        except ImportError:
-            pass
         raise RuntimeError(
-            "Silero VAD requires onnxruntime (silero_vad.onnx) or torch "
-            "(silero_vad.jit); neither could be loaded"
+            "Silero VAD requires the silero-vad package or a local "
+            "silero_vad.jit model file"
         )
 
     # ------------------------------------------------------------------
@@ -120,20 +108,14 @@ class SileroVad(SoftwareVad):
         return self._last_prob
 
     def _infer_frame(self, frame: np.ndarray) -> float:
-        if self._backend == "onnx":
-            import numpy as _np
+        # jit backend (official package or local file): m(x, sr) -> prob
+        # the model keeps its own hidden state, no external ctx needed
+        import torch
 
-            inp = _np.expand_dims(frame, axis=0).astype(_np.float32)
-            sr = _np.array(SAMPLE_RATE, dtype=_np.int64)
-            outs = self._model.run(None, {"input": inp, "sr": sr, "state": self._ctx})
-            # Silero v5 ONNX exports return (output, stateN); v4 returned 3
-            prob, self._ctx = outs[0], outs[-1]
-            return float(prob[0][0])
-
-        torch = self._torch
         with torch.no_grad():
-            prob, self._ctx, _ = self._model(
-                torch.from_numpy(frame).unsqueeze(0), SAMPLE_RATE, self._ctx
+            prob = self._model(
+                torch.from_numpy(frame.astype(np.float32)).unsqueeze(0),
+                torch.tensor(SAMPLE_RATE),
             )
         return float(prob.item())
 
@@ -143,13 +125,8 @@ class SileroVad(SoftwareVad):
     def reset(self) -> None:
         """Reset RNN state. Only call after an utterance truly ended."""
         self._carry = np.zeros(0, dtype=np.float32)
-        if self._backend == "onnx":
-            import numpy as _np
-
-            self._ctx = _np.zeros((2, 1, 128), dtype=_np.float32)
-        else:
-            self._ctx = None
-            self._model.reset_state()
+        if self._model is not None:
+            self._model.reset_states()
 
     @property
     def last_probability(self) -> float:
