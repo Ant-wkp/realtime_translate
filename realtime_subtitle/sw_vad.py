@@ -8,6 +8,8 @@ truly ended (never on segment start, which would cold-start the model).
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 SAMPLE_RATE = 16000
@@ -54,29 +56,48 @@ class SileroVad(SoftwareVad):
     # model loading
     # ------------------------------------------------------------------
     def _load(self) -> None:
+        here = os.path.dirname(os.path.abspath(__file__))
+        # script mode (python main.py) runs with CWD = package dir, module
+        # mode runs from the repo root - try both, plus plain CWD.
+        model_paths = [
+            os.path.join(here, "silero_vad.onnx"),
+            "silero_vad.onnx",
+            os.path.join(here, "silero_vad.jit"),
+            "silero_vad.jit",
+        ]
         try:
             import onnxruntime as ort
 
-            self._model = ort.InferenceSession(
-                "silero_vad.onnx", providers=["CPUExecutionProvider"]
-            )
-            self._backend = "onnx"
-            self.reset()
-            return
-        except Exception:  # noqa: BLE001 - fall through to torch
+            for path in model_paths:
+                if os.path.isfile(path):
+                    self._model = ort.InferenceSession(
+                        path, providers=["CPUExecutionProvider"]
+                    )
+                    self._backend = "onnx"
+                    break
+            if self._model is not None:
+                self.reset()
+                return
+        except ImportError:
             pass
         try:
             import torch
 
             self._torch = torch
-            self._model = torch.jit.load("silero_vad.jit")
-            self._backend = "jit"
-            self.reset()
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(
-                "Silero VAD requires onnxruntime (silero_vad.onnx) or torch "
-                "(silero_vad.jit); neither could be loaded"
-            ) from exc
+            for path in model_paths:
+                if os.path.isfile(path):
+                    self._model = torch.jit.load(path)
+                    self._backend = "jit"
+                    break
+            if self._model is not None:
+                self.reset()
+                return
+        except ImportError:
+            pass
+        raise RuntimeError(
+            "Silero VAD requires onnxruntime (silero_vad.onnx) or torch "
+            "(silero_vad.jit); neither could be loaded"
+        )
 
     # ------------------------------------------------------------------
     # inference
@@ -103,9 +124,10 @@ class SileroVad(SoftwareVad):
             import numpy as _np
 
             inp = _np.expand_dims(frame, axis=0).astype(_np.float32)
-            sr = _np.array([SAMPLE_RATE], dtype=_np.int64)
+            sr = _np.array(SAMPLE_RATE, dtype=_np.int64)
             outs = self._model.run(None, {"input": inp, "sr": sr, "state": self._ctx})
-            prob, self._ctx = outs[0], outs[2]
+            # Silero v5 ONNX exports return (output, stateN); v4 returned 3
+            prob, self._ctx = outs[0], outs[-1]
             return float(prob[0][0])
 
         torch = self._torch

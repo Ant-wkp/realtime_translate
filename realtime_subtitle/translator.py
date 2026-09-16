@@ -12,6 +12,7 @@ mixed CJK-Latin sentences and silently fell back to Chinese):
 from __future__ import annotations
 
 import logging
+import os
 import re
 
 import ctranslate2
@@ -53,16 +54,53 @@ TARGET_LANGS = {
 MIN_TRANSLATE_CHARS = 2
 
 
+def _find_model_dir() -> str:
+    """Locate an NLLB CT2 model: local models/ dir first, then HF cache.
+
+    Search paths are resolved relative to the package directory so the
+    CWD does not matter (python -m ... vs python main.py)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "models", "nllb-200-distilled-1.3B-ct2-int8"),
+        "models/nllb-200-distilled-1.3B-ct2-int8",
+        os.path.join(here, "models", "nllb-200-distilled-600M-ct2-int8"),
+        "models/nllb-200-distilled-600M-ct2-int8",
+    ]
+    for path in candidates:
+        if os.path.isfile(os.path.join(path, "model.bin")):
+            return path
+    hub = os.path.expanduser("~/.cache/huggingface/hub")
+    if os.path.isdir(hub):
+        for repo in ("models--JustFrederik--nllb-200-distilled-1.3B-ct2-int8",
+                     "models--JustFrederik--nllb-200-distilled-600M-ct2-int8"):
+            snaps = os.path.join(hub, repo, "snapshots")
+            if os.path.isdir(snaps):
+                for rev in sorted(os.listdir(snaps)):
+                    d = os.path.join(snaps, rev)
+                    if os.path.isfile(os.path.join(d, "model.bin")):
+                        return d
+    return candidates[1]  # not found; ctranslate2 will raise a clear error
+
+
+def _find_spm_file(model_path: str) -> str:
+    """CT2 NLLB repos ship either sentencepiece.model or .bpe.model."""
+    for name in ("sentencepiece.model", "sentencepiece.bpe.model"):
+        p = os.path.join(model_path, name)
+        if os.path.isfile(p):
+            return p
+    return os.path.join(model_path, "sentencepiece.model")
+
+
 class NllbCTranslate2Provider:
     def __init__(
         self,
-        model_path: str = "models/nllb-200-distilled-1.3B-ct2-int8",
+        model_path: str | None = None,
         target_langs: dict[str, str] | None = None,
     ):
-        self.model_path = model_path
-        self.translator = ctranslate2.Translator(model_path, compute_type="int8")
+        self.model_path = model_path or _find_model_dir()
+        self.translator = ctranslate2.Translator(self.model_path, compute_type="int8")
         self.sp = spm.SentencePieceProcessor(
-            model_file=f"{model_path}/sentencepiece.model"
+            model_file=_find_spm_file(self.model_path)
         )
         self.beam_size = 4
         self.length_penalty = 1.0

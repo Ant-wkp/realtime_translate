@@ -25,6 +25,17 @@ import uuid
 
 import numpy as np
 
+# Support both "python -m realtime_subtitle.main" and "python main.py":
+# when executed as a script there is no package context, so inject the
+# repo root into sys.path and register the package name before any
+# relative import below runs.
+if __package__ is None or __package__ == "":
+    _pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    _repo_root = os.path.dirname(_pkg_dir)
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    __package__ = "realtime_subtitle"
+
 # avoid XET download failures with huggingface_hub
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
@@ -247,14 +258,8 @@ def main(argv=None) -> int:
 
     from .translator import NllbCTranslate2Provider
 
-    model_path = "models/nllb-200-distilled-1.3B-ct2-int8"
-    if not os.path.isdir(model_path):
-        fallback = "models/nllb-200-distilled-600M-ct2-int8"
-        if os.path.isdir(fallback):
-            model_path = fallback
-            print("[NLLB] 1.3B not found, falling back to 600M (rollback dir)")
-    translator = NllbCTranslate2Provider(model_path=model_path)
-    print(f"[NLLB] model: {model_path}")
+    translator = NllbCTranslate2Provider()
+    print(f"[NLLB] model: {translator.model_path}")
 
     from .sw_vad import SileroVad
 
@@ -270,6 +275,10 @@ def main(argv=None) -> int:
     control = ControlHandler(device, locator, translator)
     print(f"[WS] subtitle service: http://0.0.0.0:{args.port}/")
 
+    # per-segment timing anchors for end-to-end latency stats
+    speech_end_at: dict[str, float] = {}
+    asr_done_at: dict[str, float] = {}
+
     translation = TranslationThread(translator, server,
                                      speech_end_at=speech_end_at,
                                      asr_done_at=asr_done_at)
@@ -284,10 +293,6 @@ def main(argv=None) -> int:
         server.broadcast({
             "type": "partial", "id": stream_id, "ts": time.time(), "text": text,
         })
-
-    # per-segment timing anchors for end-to-end latency stats
-    speech_end_at: dict[str, float] = {}
-    asr_done_at: dict[str, float] = {}
 
     from .transcriber import TranscriberWorker
 
