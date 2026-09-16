@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 
 import numpy as np
 
@@ -48,7 +49,7 @@ VAD_INTERVAL = 0.1          # main loop tick, seconds
 SILENCE_HOLD = 0.6          # trailing silence before flush
 MIN_SECONDS = 0.5           # shortest valid segment
 MAX_SECONDS = 20.0          # force-cut overlong segments
-PRE_ROLL_SECONDS = 0.5      # buffer before segment start, merged on open
+PRE_ROLL_DEFAULT = 1.0      # ring-buffer window retained before segment start
 SW_FRAME_THRESHOLD = 0.5    # Silero per-frame speech threshold
 SHORT_EXEMPT_SECONDS = 1.0  # short-segment exemption window
 SHORT_EXEMPT_MAX_PROB = 0.5 # peak probability required for exemption
@@ -89,15 +90,22 @@ class VadDoaReader(threading.Thread):
 class TranslationThread(threading.Thread):
     """Serial NLLB worker; translation never blocks source display."""
 
-    def __init__(self, translator, server, speech_end_at: dict | None = None,
-                 asr_done_at: dict | None = None):
+    def __init__(self, translator, server, speech_end_at: dict | None = None):
         super().__init__(daemon=True, name="TranslationThread")
         self.translator = translator
         self.server = server
         self.speech_end_at = speech_end_at if speech_end_at is not None else {}
-        self.asr_done_at = asr_done_at if asr_done_at is not None else {}
         self.job_queue: queue.Queue = queue.Queue()
         self._stop = threading.Event()
+        # rolling end-to-end stats, printed on the terminal only (the
+        # frontend stays a pure renderer and gets no latency fields)
+        self._e2e_n = 0
+        self._e2e_sum = 0.0
+
+    def summary(self) -> str:
+        if not self._e2e_n:
+            return ""
+        return f"{self._e2e_n} 句, 均值 {self._e2e_sum / self._e2e_n:.2f}s"
 
     def submit(self, task_id: str, text: str, lang: str) -> None:
         self.job_queue.put({"task_id": task_id, "text": text, "lang": lang})
@@ -119,20 +127,18 @@ class TranslationThread(threading.Thread):
                     "ts": time.time(),
                     "text": text,
                     "target_lang": target,
-                    "latency_ms": trans_ms,
                 })
-                # end-to-end stats: speech end -> translation on screen
+                # end-to-end stats: speech end -> translation printed here.
+                # Terminal-only (old-version semantics): latency measurement
+                # lives on the backend, the frontend never sees it.
                 speech_end = self.speech_end_at.pop(job["task_id"], None)
-                asr_done = self.asr_done_at.pop(job["task_id"], None)
-                if speech_end is not None and asr_done is not None:
-                    self.server.broadcast({
-                        "type": "latency.update",
-                        "id": job["task_id"],
-                        "ts": time.time(),
-                        "asr_ms": int((asr_done - speech_end) * 1000),
-                        "trans_ms": trans_ms,
-                        "e2e_ms": int((time.monotonic() - speech_end) * 1000),
-                    })
+                if speech_end is not None:
+                    e2e = time.monotonic() - speech_end
+                    self._e2e_n += 1
+                    self._e2e_sum += e2e
+                    print(f"[耗时] {job['task_id'][:8]} 说完→译文上屏: {e2e:.2f}s "
+                          f"(均值 {self._e2e_sum / self._e2e_n:.2f}s / "
+                          f"{self._e2e_n} 句)")
             except Exception as exc:  # noqa: BLE001
                 print(f"[NLLB] translate failed: {exc}")
 
@@ -218,6 +224,11 @@ def parse_args(argv=None):
     p.add_argument("--silence-hold", type=float, default=SILENCE_HOLD)
     p.add_argument("--min-seconds", type=float, default=MIN_SECONDS)
     p.add_argument("--max-seconds", type=float, default=MAX_SECONDS)
+    p.add_argument("--pre-roll", type=float, default=PRE_ROLL_DEFAULT,
+                   help="seconds of audio retained before segment start; the "
+                        "first streaming chunk is filled from this ring buffer "
+                        "so the model decodes the opening words immediately "
+                        "instead of waiting 600ms for a full chunk")
     p.add_argument("--beam-recon", action="store_true", help="read-only beam probe then exit")
     p.add_argument("--beam-select", action="store_true", help="apply beam route then exit")
     p.add_argument("--list-devices", action="store_true")
@@ -361,11 +372,18 @@ def main(argv=None) -> int:
 
     # per-segment timing anchors for end-to-end latency stats
     speech_end_at: dict[str, float] = {}
-    asr_done_at: dict[str, float] = {}
+    seg_durations: dict[str, float] = {}
+    # first-character latency: segment open -> first non-empty partial
+    seg_open_at: dict[str, float] = {}
+    seg_seed_secs: dict[str, float] = {}
+    first_char_logged: set[str] = set()
+    # rolling stats for the [首字] line; guarded because on_partial runs on
+    # the transcriber worker while flush runs on the main loop
+    first_char_stats = {"n": 0, "sum": 0.0, "miss": 0}
+    first_char_lock = threading.Lock()
 
     translation = TranslationThread(translator, server,
-                                     speech_end_at=speech_end_at,
-                                     asr_done_at=asr_done_at)
+                                     speech_end_at=speech_end_at)
     translation.start()
 
     result_queue: queue.Queue = queue.Queue()
@@ -374,6 +392,24 @@ def main(argv=None) -> int:
         result_queue.put(result)
 
     def on_partial(stream_id, text):
+        # first-character latency: first non-empty partial after the segment
+        # opened. This is the number the pre-roll seed is meant to shrink -
+        # the [耗时] line measures "after speech ended", which is a different
+        # (and unchanged) quantity.
+        if text:
+            with first_char_lock:
+                if stream_id not in first_char_logged:
+                    first_char_logged.add(stream_id)
+                    opened = seg_open_at.get(stream_id)
+                    if opened is not None:
+                        dt = time.monotonic() - opened
+                        first_char_stats["n"] += 1
+                        first_char_stats["sum"] += dt
+                        n = first_char_stats["n"]
+                        avg = first_char_stats["sum"] / n
+                        seed = seg_seed_secs.get(stream_id, 0.0)
+                        print(f"[首字] {stream_id[:8]} 张嘴→首字: {dt:.2f}s "
+                              f"(均值 {avg:.2f}s / {n} 句, seed {seed:.2f}s)")
         server.broadcast({
             "type": "partial", "id": stream_id, "ts": time.time(), "text": text,
         })
@@ -411,7 +447,15 @@ def main(argv=None) -> int:
 
     speaking = False
     utterance: list[np.ndarray] = []
-    pre_roll: list[np.ndarray] = []
+    # Ring buffer of the most recent audio, kept unconditionally (silence
+    # included) so that the instant a segment opens the whole window can be
+    # fed as the first streaming chunk. The Paraformer online model advances
+    # one chunk_stride (600ms) at a time, so without this the opening words
+    # wait for a full stride to accumulate - the dominant term in the ~0.7s
+    # first-character latency. 1s of history fills the stride at once.
+    pre_roll: deque[np.ndarray] = deque()
+    pre_roll_samples = 0
+    PRE_ROLL_SAMPLES_MAX = int(args.pre_roll * SAMPLE_RATE)
     seg_start = 0.0
     last_speech_at = 0.0
     silence_low_ticks = 0     # consecutive ticks with sw_prob < 0.2
@@ -459,6 +503,9 @@ def main(argv=None) -> int:
             transcriber.stream_abort(current_id)
         if current_id:
             server.broadcast({"type": "discard", "id": current_id, "ts": time.time()})
+            seg_open_at.pop(current_id, None)
+            seg_seed_secs.pop(current_id, None)
+            first_char_logged.discard(current_id)
         if args.debug_gate and current_id:
             ratio = sw_speech_frames / total_frames if total_frames else 0.0
             avg = prob_sum / total_frames if total_frames else 0.0
@@ -475,6 +522,9 @@ def main(argv=None) -> int:
         stream_opened = False
         speaking = False
         silence_low_ticks = 0
+        # the discarded audio must not seed the next segment either
+        pre_roll.clear()
+        pre_roll_samples = 0
         sw_vad.reset()  # legal reset point: utterance truly ended
 
     def audio_dur() -> float:
@@ -582,12 +632,14 @@ def main(argv=None) -> int:
 
                 # 4) route audio (three destinations)
                 for c in chunks:
+                    # the ring buffer is fed unconditionally - silence and
+                    # speech alike - so it is always at full depth when the
+                    # gate opens (see pre_roll declaration). Keeping it warm
+                    # while speaking also means the next segment opens with
+                    # the previous tail already buffered.
+                    pre_roll_push(c)
                     if speaking:
                         utterance.append(c)
-                    elif not speaking and hw_vad == 1:
-                        pre_roll.append(c)
-                    else:
-                        pass
                 # streaming: one merged feed per tick (100ms) instead of
                 # one task per callback block - the worker queue drains
                 # 3-4x fewer tasks and partials surface earlier
@@ -596,8 +648,6 @@ def main(argv=None) -> int:
                         current_id,
                         np.concatenate(chunks) if len(chunks) > 1 else chunks[0],
                         current_id)
-                if not speaking and pre_roll and gate:
-                    pass  # merged at segment open below
 
                 # state transitions
                 if not speaking:
@@ -606,14 +656,20 @@ def main(argv=None) -> int:
                         seg_start = now
                         last_speech_at = now
                         current_id = uuid.uuid4().hex[:12]
-                        if pre_roll:
-                            utterance = list(pre_roll)
-                            pre_roll = []
+                        seg_open_at[current_id] = time.monotonic()
+                        # take the whole pre-roll window as the seed audio:
+                        # the online model's own prev_samples buffer is then
+                        # already past one 600ms stride, so the opening words
+                        # decode on the very first generate() call
+                        seed = pre_roll_take()
+                        utterance = [seed] if seed.size else []
+                        seg_seed_secs[current_id] = seed.size / SAMPLE_RATE
                         if args.streaming and provider.supports_streaming:
                             transcriber.stream_start(current_id)
-                            transcriber.stream_feed(current_id, np.concatenate(utterance) if utterance else np.zeros(0, np.float32), current_id)
+                            transcriber.stream_feed(current_id, seed if seed.size else np.zeros(0, np.float32), current_id)
                             stream_opened = True
-                        print(f"[seg] open {current_id}")
+                        print(f"[seg] open {current_id} "
+                              f"(seed {seed.size / SAMPLE_RATE:.2f}s)")
                 else:
                     # accumulate statistics only while speech may be active
                     if chunks:
@@ -653,7 +709,26 @@ def main(argv=None) -> int:
                         flush_segment()
                         if seg_id_before_flush:
                             speech_end_at[seg_id_before_flush] = time.monotonic()
-                        pre_roll = []
+                            seg_durations[seg_id_before_flush] = now - seg_start
+                            seg_open_at.pop(seg_id_before_flush, None)
+                            seg_seed_secs.pop(seg_id_before_flush, None)
+                            # a flushed segment that never produced a partial
+                            # is the short-utterance case: the 600ms stride
+                            # means one-chunk sentences decode only at finish.
+                            # Counted so the summary can report coverage
+                            # instead of silently omitting them.
+                            if seg_id_before_flush not in first_char_logged:
+                                first_char_stats["miss"] += 1
+                            first_char_logged.discard(seg_id_before_flush)
+                        # Must clear: keeping the tail would seed the next
+                        # stream with this sentence's speech, and the fresh
+                        # stream would re-decode those words into its own
+                        # partial (visible duplicate text). The hold period
+                        # then refills the window with real silence, so a
+                        # normal silence_hold flush still opens the next
+                        # segment with a ~0.6s seed.
+                        pre_roll.clear()
+                        pre_roll_samples = 0
 
                 # 5) frontend commands
                 while True:
@@ -681,6 +756,17 @@ def main(argv=None) -> int:
                     print(f"[asr] {task_id} final={is_final} "
                           f"decode={result.latency * 1000:.0f}ms "
                           f"text={result.text[:40]!r}")
+                    # terminal-only latency stat (old-version format): the
+                    # final text replacing the partial marks "source on
+                    # screen" for this utterance
+                    if is_final:
+                        speech_end = speech_end_at.get(task_id)
+                        seg_len = seg_durations.pop(task_id, None)
+                        if speech_end is not None:
+                            src_e2e = time.monotonic() - speech_end
+                            seg_txt = f" (段时长 {seg_len:.2f}s)" if seg_len else ""
+                            print(f"[耗时] {task_id[:8]} 说完→原文上屏: "
+                                  f"{src_e2e:.2f}s{seg_txt}")
                     server.broadcast({
                         "type": "final" if is_final else "source",
                         "id": task_id,
@@ -688,9 +774,7 @@ def main(argv=None) -> int:
                         "doa": result.meta.get("doa", ""),
                         "text": result.text,
                         "lang": result.language,
-                        "latency_ms": int(result.latency * 1000),
                     })
-                    asr_done_at[task_id] = time.monotonic()
                     translation.submit(task_id, result.text, result.language)
 
                 # heartbeat broadcast
@@ -707,6 +791,16 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print("\n[main] stopping")
     finally:
+        summary = translation.summary()
+        if summary:
+            print(f"[耗时] 译文端到端汇总: {summary}")
+        with first_char_lock:
+            fn = first_char_stats["n"]
+            fmiss = first_char_stats["miss"]
+            fsum = first_char_stats["sum"]
+        if fn:
+            print(f"[首字] 汇总: {fn} 句有 partial, 均值 {fsum / fn:.2f}s"
+                  + (f", 另 {fmiss} 句太短无 partial" if fmiss else ""))
         if vad_reader:
             vad_reader.stop()
         transcriber.stop()
