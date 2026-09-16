@@ -20,7 +20,6 @@ from .asr import AsrProvider, AsrResult
 class _Utterance:
     stream_id: str
     chunks: list = field(default_factory=list)          # full audio (for final re-decode)
-    pend: list = field(default_factory=list)            # samples waiting for the next 600ms decode
     cache: dict = field(default_factory=dict)           # streaming state, persists across chunks
     partial_parts: list = field(default_factory=list)   # accumulated partial text
     aborted: bool = False
@@ -30,7 +29,6 @@ class FunasrProvider(AsrProvider):
     name = "funasr"
     supports_streaming = True
 
-    STREAM_CHUNK_MS = 600   # decode one streaming chunk every ~600ms
     # FunASR chunk_size units are 60ms frames: [5, 10, 5] =
     # 300ms left context, 600ms center, 300ms right context
     CHUNK_SIZE = [5, 10, 5]
@@ -82,16 +80,15 @@ class FunasrProvider(AsrProvider):
         if self._stream is None:
             return "".join(utt.partial_parts)
 
-        # accumulate samples until a full streaming chunk is ready; decoding
-        # every 100ms tick would thrash the model and spam rtf progress bars
-        utt.pend.append(audio)
-        pend = np.concatenate(utt.pend) if utt.pend else np.zeros(0, np.float32)
-        if pend.size < self.STREAM_CHUNK_MS * 16:
-            return "".join(utt.partial_parts)
-        utt.pend = []
-
+        # Pass every tick's audio straight through: the model keeps its own
+        # leftover buffer (cache["prev_samples"]) and advances one 600ms
+        # chunk whenever enough audio has accumulated. Small frequent feeds
+        # keep the 300ms right-context window supplied so tokens keep
+        # flowing; batching at 600ms starves that context and stalls all
+        # partials until is_final (verified against funasr 1.4.12
+        # paraformer_streaming/model.py inference()).
         res = self._stream.generate(
-            input=pend,
+            input=audio,
             cache=utt.cache,            # state persists across chunks
             is_final=False,
             chunk_size=self.CHUNK_SIZE,
@@ -114,10 +111,13 @@ class FunasrProvider(AsrProvider):
         utt = self._utts.pop(stream_id, None)
         if utt is None or utt.aborted:
             return "", np.zeros(0, dtype=np.float32)
-        if self._stream is not None and utt.pend:
+        if self._stream is not None:
+            # is_final flushes the tail chunk: the model decodes whatever
+            # sits in cache["prev_samples"] plus the right-context tokens it
+            # had been holding back, releasing the last words immediately.
             try:
                 res = self._stream.generate(
-                    input=np.concatenate(utt.pend),
+                    input=np.zeros(0, dtype=np.float32),
                     cache=utt.cache,
                     is_final=True,
                     chunk_size=self.CHUNK_SIZE,
@@ -128,7 +128,6 @@ class FunasrProvider(AsrProvider):
                     utt.partial_parts.append(delta)
             except Exception:  # noqa: BLE001 - tail pass is best-effort
                 pass
-            utt.pend = []
         audio = (
             np.concatenate(utt.chunks) if utt.chunks
             else np.zeros(0, dtype=np.float32)

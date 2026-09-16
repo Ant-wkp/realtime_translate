@@ -371,7 +371,11 @@ def main(argv=None) -> int:
     final_decode.start()
 
     def on_final_request(req):
-        final_decode.submit(req.task_id, req.audio, doa=req.doa,
+        # trim trailing silence before the offline re-decode: hold-period
+        # ticks feed quiet audio into the stream, and silence tails both
+        # slow the decode and seed phantom punctuation
+        audio = _trim_tail(req.audio) if req.audio is not None and req.audio.size else req.audio
+        final_decode.submit(req.task_id, audio, doa=req.doa,
                             partial_hint=req.partial_hint)
 
     transcriber = TranscriberWorker(provider, on_result=on_asr_result,
@@ -397,6 +401,7 @@ def main(argv=None) -> int:
     pre_roll: list[np.ndarray] = []
     seg_start = 0.0
     last_speech_at = 0.0
+    silence_low_ticks = 0     # consecutive ticks with sw_prob < 0.2
     hw_speech_ticks = 0
     sw_speech_frames = 0
     total_frames = 0            # counted only up to last_speech_at
@@ -436,6 +441,7 @@ def main(argv=None) -> int:
         """Single discard path: abort stream, broadcast, reset, go idle."""
         nonlocal speaking, utterance, hw_speech_ticks, sw_speech_frames
         nonlocal total_frames, prob_sum, max_prob, current_id, stream_opened
+        nonlocal silence_low_ticks
         if stream_opened and current_id:
             transcriber.stream_abort(current_id)
         if current_id:
@@ -455,6 +461,7 @@ def main(argv=None) -> int:
         current_id = ""
         stream_opened = False
         speaking = False
+        silence_low_ticks = 0
         sw_vad.reset()  # legal reset point: utterance truly ended
 
     def audio_dur() -> float:
@@ -463,6 +470,7 @@ def main(argv=None) -> int:
     def flush_segment() -> None:
         nonlocal speaking, utterance, hw_speech_ticks, sw_speech_frames
         nonlocal total_frames, prob_sum, max_prob, current_id, stream_opened
+        nonlocal silence_low_ticks
         audio = np.concatenate(utterance) if utterance else np.zeros(0, np.float32)
         utterance = []
         duration = audio.size / SAMPLE_RATE
@@ -503,6 +511,7 @@ def main(argv=None) -> int:
         prob_sum = 0.0
         max_prob = 0.0
         speaking = False
+        silence_low_ticks = 0
         sw_vad.reset()
 
     def _trim_tail(audio: np.ndarray) -> np.ndarray:
@@ -607,20 +616,27 @@ def main(argv=None) -> int:
                     max_prob = max(max_prob, sw_prob)
                     hw_speech_ticks += 1 if hw_vad else 0
 
+                    # end-of-utterance confirmation: count CONSECUTIVE ticks
+                    # with clearly non-speech Silero probability. Word gaps
+                    # inside a sentence hold probabilities around 0.3-0.5, so
+                    # three straight ticks below 0.2 (~0.3s) is a strong
+                    # silence signal. A single-tick cut (tried before)
+                    # fragmented utterances mid-sentence and starved the
+                    # 600ms streaming chunks; consecutive confirmation is
+                    # immune to momentary dips because any speech-like tick
+                    # resets the counter.
+                    if gate or sw_prob >= 0.2:
+                        silence_low_ticks = 0
+                    else:
+                        silence_low_ticks += 1
+
                     silence = now - last_speech_at
                     overlong = now - seg_start >= args.max_seconds
-                    # fast-cut: Silero confirms the silence earlier than the
-                    # fixed hold - once the trailing silence exceeds 0.25s
-                    # and the current frame is clearly non-speech, the
-                    # utterance is over; no need to wait the full 0.6s hold
-                    fast_cut = (
-                        speaking
-                        and silence > 0.25
-                        and sw_prob < 0.2
-                    )
-                    if silence >= args.silence_hold or overlong or fast_cut:
+                    early_end = silence_low_ticks >= 3 and silence >= 0.3
+                    if silence >= args.silence_hold or overlong or early_end:
                         seg_id_before_flush = current_id
-                        print(f"[seg] flush after {now - seg_start:.2f}s")
+                        print(f"[seg] flush after {now - seg_start:.2f}s "
+                              f"(tail wait {silence:.2f}s)")
                         flush_segment()
                         if seg_id_before_flush:
                             speech_end_at[seg_id_before_flush] = time.monotonic()
@@ -649,9 +665,9 @@ def main(argv=None) -> int:
                     if not result.text:
                         continue
                     is_final = bool(result.meta.get("final_replaces_partial"))
-                    if args.debug_gate:
-                        print(f"[asr] {task_id} final={is_final} lang={result.language} "
-                              f"lat={result.latency:.2f}s text={result.text[:60]!r}")
+                    print(f"[asr] {task_id} final={is_final} "
+                          f"decode={result.latency * 1000:.0f}ms "
+                          f"text={result.text[:40]!r}")
                     server.broadcast({
                         "type": "final" if is_final else "source",
                         "id": task_id,

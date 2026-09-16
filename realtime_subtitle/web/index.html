@@ -246,7 +246,49 @@ function cardFor(id, partial){
   return el;
 }
 
+// ---- typewriter reveal: partials arrive in bursts (one per ~600ms decode
+// chunk); reveal the new characters one by one so text appears char-by-char
+// while the cursor blinks, instead of jumping in word-sized blocks.
+function stopType(el){
+  if (el._typeT){ clearTimeout(el._typeT); el._typeT = null; }
+}
+function syncType(el){
+  const target = el._target || "";
+  const shown = Math.min(el._shown || 0, target.length);
+  el._shown = shown;
+  const txt = el.querySelector(".src-text");
+  if (txt) txt.textContent = target.slice(0, shown);
+  let cur = el.querySelector(".cursor");
+  if (cur && cur.previousSibling !== txt){
+    cur.remove();
+    cur = null;
+  }
+  if (!cur && txt && txt.parentNode){
+    cur = document.createElement("span");
+    cur.className = "cursor";
+    txt.parentNode.insertBefore(cur, txt.nextSibling);
+  }
+}
+function pumpType(el){
+  if (el._typeT) return;
+  const step = () => {
+    el._typeT = null;
+    const target = el._target || "";
+    const shown = el._shown || 0;
+    if (shown >= target.length) return;
+    el._shown = shown + 1;
+    syncType(el);
+    scrollIfStuck();
+    const remain = target.length - el._shown;
+    // pace to finish the backlog before the next burst (~600ms away)
+    const delay = Math.max(30, Math.min(95, Math.round(500 / Math.max(1, remain))));
+    el._typeT = setTimeout(step, delay);
+  };
+  el._typeT = setTimeout(step, 35);
+}
+
 function freezeCard(el, lang){
+  stopType(el);
   const cur = el.querySelector(".cursor");
   if (cur) cur.remove();
   const trans = el.querySelector(".trans");
@@ -264,6 +306,9 @@ function handle(msg){
     case "source": {
       removeEmpty();
       const el = cardFor(msg.id);
+      stopType(el);
+      el._target = msg.text || "";
+      el._shown = el._target.length;
       freezeCard(el, msg.lang);
       el.querySelector(".src-text").textContent = msg.text || "";
       if (msg.latency_ms){
@@ -276,6 +321,9 @@ function handle(msg){
     case "final": {
       removeEmpty();
       const el = cardFor(msg.id);
+      stopType(el);
+      el._target = msg.text || "";
+      el._shown = el._target.length;
       freezeCard(el, msg.lang);
       el.querySelector(".src-text").textContent = msg.text || "";
       if (msg.latency_ms){
@@ -288,20 +336,13 @@ function handle(msg){
     case "partial": {
       removeEmpty();
       const el = cardFor(msg.id, true);
-      let txt = el.querySelector(".src-text");
-      let cur = el.querySelector(".cursor");
-      // keep the cursor after the text (re-append if it exists)
-      txt.textContent = msg.text || "";
-      if (cur && cur.parentNode) cur.remove();
-      cur = document.createElement("span");
-      cur.className = "cursor";
-      txt.parentNode.insertBefore(cur, txt.nextSibling);
-      scrollIfStuck();
+      el._target = msg.text || "";
+      pumpType(el);
       break;
     }
     case "discard": {
       const el = cards.get(msg.id);
-      if (el){ el.remove(); cards.delete(msg.id); }
+      if (el){ stopType(el); el.remove(); cards.delete(msg.id); }
       if (!cards.size) stream.appendChild(empty);
       break;
     }
