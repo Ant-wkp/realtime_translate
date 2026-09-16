@@ -31,9 +31,19 @@ class BroadcastServer:
                                         name="BroadcastServer")
         self._loop = None
         self._stop_evt = threading.Event()
+        self._ready_evt = threading.Event()
+        self._bind_error: BaseException | None = None
 
-    def start(self) -> None:
+    def start(self, timeout: float = 5.0) -> None:
         self._thread.start()
+        # fail fast: abort the whole process if the port cannot be bound,
+        # instead of running a headless main loop with a dead web server.
+        if not self._ready_evt.wait(timeout):
+            raise RuntimeError("web server did not start in time")
+        if self._bind_error is not None:
+            raise RuntimeError(
+                f"cannot bind {self.host}:{self.port}: {self._bind_error}"
+            ) from self._bind_error
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -74,18 +84,23 @@ class BroadcastServer:
                 )
             return None  # fall back -> 404
 
-        async with serve(
-            handler,
-            self.host,
-            self.port,
-            process_request=http_handler,
-            ping_interval=20,
-        ):
-            pump = asyncio.create_task(self._pump())
-            try:
-                await asyncio.Future()  # run until stopped
-            finally:
-                pump.cancel()
+        try:
+            async with serve(
+                handler,
+                self.host,
+                self.port,
+                process_request=http_handler,
+                ping_interval=20,
+            ):
+                self._ready_evt.set()
+                pump = asyncio.create_task(self._pump())
+                try:
+                    await asyncio.Future()  # run until stopped
+                finally:
+                    pump.cancel()
+        except OSError as exc:
+            self._bind_error = exc
+            self._ready_evt.set()
 
     async def _pump(self) -> None:
         while True:
