@@ -76,10 +76,13 @@ class VadDoaReader(threading.Thread):
 class TranslationThread(threading.Thread):
     """Serial NLLB worker; translation never blocks source display."""
 
-    def __init__(self, translator, server):
+    def __init__(self, translator, server, speech_end_at: dict | None = None,
+                 asr_done_at: dict | None = None):
         super().__init__(daemon=True, name="TranslationThread")
         self.translator = translator
         self.server = server
+        self.speech_end_at = speech_end_at if speech_end_at is not None else {}
+        self.asr_done_at = asr_done_at if asr_done_at is not None else {}
         self.job_queue: queue.Queue = queue.Queue()
         self._stop = threading.Event()
 
@@ -95,14 +98,27 @@ class TranslationThread(threading.Thread):
             start = time.monotonic()
             try:
                 text, target = self.translator.translate(job["text"], job["lang"])
+                trans_ms = int((time.monotonic() - start) * 1000)
                 self.server.broadcast({
                     "type": "translation",
                     "id": job["task_id"],
                     "ts": time.time(),
                     "text": text,
                     "target_lang": target,
-                    "latency_ms": int((time.monotonic() - start) * 1000),
+                    "latency_ms": trans_ms,
                 })
+                # end-to-end stats: speech end -> translation on screen
+                speech_end = self.speech_end_at.pop(job["task_id"], None)
+                asr_done = self.asr_done_at.pop(job["task_id"], None)
+                if speech_end is not None and asr_done is not None:
+                    self.server.broadcast({
+                        "type": "latency.update",
+                        "id": job["task_id"],
+                        "ts": time.time(),
+                        "asr_ms": int((asr_done - speech_end) * 1000),
+                        "trans_ms": trans_ms,
+                        "e2e_ms": int((time.monotonic() - speech_end) * 1000),
+                    })
             except Exception as exc:  # noqa: BLE001
                 print(f"[NLLB] translate failed: {exc}")
 
@@ -254,7 +270,9 @@ def main(argv=None) -> int:
     control = ControlHandler(device, locator, translator)
     print(f"[WS] subtitle service: http://0.0.0.0:{args.port}/")
 
-    translation = TranslationThread(translator, server)
+    translation = TranslationThread(translator, server,
+                                     speech_end_at=speech_end_at,
+                                     asr_done_at=asr_done_at)
     translation.start()
 
     result_queue: queue.Queue = queue.Queue()
@@ -266,6 +284,10 @@ def main(argv=None) -> int:
         server.broadcast({
             "type": "partial", "id": stream_id, "ts": time.time(), "text": text,
         })
+
+    # per-segment timing anchors for end-to-end latency stats
+    speech_end_at: dict[str, float] = {}
+    asr_done_at: dict[str, float] = {}
 
     from .transcriber import TranscriberWorker
 
@@ -479,8 +501,11 @@ def main(argv=None) -> int:
                     silence = now - last_speech_at
                     overlong = now - seg_start >= args.max_seconds
                     if silence >= args.silence_hold or overlong:
+                        seg_id_before_flush = current_id
                         print(f"[seg] flush after {now - seg_start:.2f}s")
                         flush_segment()
+                        if seg_id_before_flush:
+                            speech_end_at[seg_id_before_flush] = time.monotonic()
                         pre_roll = []
 
                 # 5) frontend commands
@@ -505,14 +530,17 @@ def main(argv=None) -> int:
                     task_id = result.meta.get("task_id", "")
                     if not result.text:
                         continue
+                    is_final = bool(result.meta.get("final_replaces_partial"))
                     server.broadcast({
-                        "type": "source",
+                        "type": "final" if is_final else "source",
                         "id": task_id,
                         "ts": time.time(),
                         "doa": result.meta.get("doa", ""),
                         "text": result.text,
                         "lang": result.language,
+                        "latency_ms": int(result.latency * 1000),
                     })
+                    asr_done_at[task_id] = time.monotonic()
                     translation.submit(task_id, result.text, result.language)
 
                 # heartbeat broadcast

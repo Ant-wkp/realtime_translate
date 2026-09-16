@@ -39,6 +39,7 @@ header{
   animation:breathe 3.2s ease-in-out infinite}
 @keyframes breathe{0%,100%{opacity:.75;transform:scale(.96)}50%{opacity:1;transform:scale(1)}}
 header h1{font-size:1rem;font-weight:600;letter-spacing:.02em}
+#latency{font-size:.72rem;color:var(--text-dim);font-family:ui-monospace,Consolas,monospace}
 .spacer{flex:1}
 #dot{width:9px;height:9px;border-radius:50%;background:#64748b;transition:background .3s;
   box-shadow:0 0 10px transparent}
@@ -68,6 +69,8 @@ main{max-width:860px;margin:0 auto;padding:1.1rem 1rem 6rem;display:flex;
 .card::before{content:"";position:absolute;left:0;top:14%;bottom:14%;width:3px;
   border-radius:3px;background:linear-gradient(180deg,var(--accent),var(--accent-2))}
 .meta{display:flex;align-items:center;gap:.5rem;margin-bottom:.45rem;flex-wrap:wrap}
+.meta .mstats{margin-left:auto;font-size:.62rem;color:var(--text-dim);
+  font-family:ui-monospace,Consolas,monospace}
 .pill{font-size:.68rem;padding:.14rem .55rem;border-radius:99px;color:var(--accent);
   background:rgba(76,201,240,.10);border:1px solid rgba(76,201,240,.28)}
 .pill.src{color:#fbbf24;background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.25)}
@@ -126,6 +129,8 @@ select:focus,input[type=text]:focus{border-color:var(--accent)}
 .cmd{display:flex;gap:.45rem;align-items:center;padding:.3rem 0;font-size:.72rem;
   font-family:ui-monospace,Consolas,monospace}
 .cmd .cname{flex:1;color:var(--text)}
+.cmd .val{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  color:var(--accent);font-size:.64rem}
 .cmd .ro{font-size:.58rem;color:var(--text-dim)}
 .cmd input{width:110px;padding:.28rem .4rem;margin:0;border-radius:6px;font-size:.68rem}
 .mini{padding:.28rem .55rem;border:none;border-radius:6px;cursor:pointer;font-size:.66rem;
@@ -149,6 +154,7 @@ select:focus,input[type=text]:focus{border-color:var(--accent)}
   <div class="logo"></div>
   <h1>reSpeaker 实时双语字幕</h1>
   <div class="spacer"></div>
+  <span id="latency" title="端到端延迟"></span>
   <span id="gate">--</span>
   <div id="dot" title="连接状态"></div>
   <button id="gear" title="设置">
@@ -213,12 +219,13 @@ function removeEmpty(){
   if (empty && empty.parentNode) empty.remove();
 }
 function cardFor(id){
-  let el = cards.get(id);
+    let el = cards.get(id);
   if (!el){
     el = document.createElement("div");
     el.className = "card";
     el.innerHTML =
-      '<div class="meta"><span class="pill src">partial</span></div>' +
+      '<div class="meta"><span class="pill src">partial</span>' +
+      '<span class="mstats"></span></div>' +
       '<div class="src-text"></div>' +
       '<div class="trans pending">翻译中…</div>';
     stream.appendChild(el);
@@ -242,6 +249,10 @@ function handle(msg){
       const pill = el.querySelector(".pill");
       pill.textContent = (msg.lang === "zh" ? "中→" : "外→") + (msg.lang || "?");
       pill.className = "pill";
+      if (msg.latency_ms){
+        const s = el.querySelector(".mstats");
+        if (s) s.textContent = "asr " + msg.latency_ms + "ms";
+      }
       scrollIfStuck();
       break;
     }
@@ -273,6 +284,17 @@ function handle(msg){
       $("gate").textContent = (msg.gate_mode || "--") +
         (msg.hw_vad ? " · 说" : " · 静");
       break;
+    case "latency.update": {
+      $("latency").textContent =
+        "e2e " + (msg.e2e_ms / 1000).toFixed(2) + "s";
+      const el = cards.get(msg.id);
+      if (el){
+        const s = el.querySelector(".mstats");
+        if (s) s.textContent =
+          "asr " + msg.asr_ms + "ms · tr " + msg.trans_ms + "ms";
+      }
+      break;
+    }
     case "cmd_result":
       if (msg.ok === false) toast("命令失败: " + (msg.error || ""), "err");
       break;
@@ -282,7 +304,22 @@ function handle(msg){
 function sendCmd(cmd, payload){
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({cmd, payload}));
 }
-function onCmdResult(msg){ if (msg.ok === false) toast(msg.error || "failed", "err"); }
+function onCmdResult(msg){
+  if (msg.ok === false){ toast(msg.error || "failed", "err"); return; }
+  // read results: backfill the value next to the command row
+  if (msg.data && msg.data.name && msg.data.value !== undefined){
+    const row = document.querySelector(
+      '.cmd[data-await-name="' + CSS.escape(msg.data.name) + '"]');
+    if (row){
+      const val = row.querySelector(".val");
+      if (val){
+        val.textContent = JSON.stringify(msg.data.value);
+        val.title = JSON.stringify(msg.data.value);
+      }
+    }
+    toast("读取 " + msg.data.name + " 成功", "ok");
+  }
+}
 
 function renderTargets(data){
   const opts = data.options || {};
@@ -321,12 +358,15 @@ function renderCommandGroups(data){
       const row = document.createElement("div");
       row.className = "cmd";
       row.innerHTML = '<span class="cname">' + esc(c.name) + "</span>" +
+        '<span class="val"></span>' +
         (c.access === "ro" ? '<span class="ro">ro</span>' :
           '<input type="text" placeholder="json">') +
         '<button class="mini read">读</button>' +
         (c.access === "rw" ? '<button class="mini write">写</button>' : "");
-      row.querySelector(".read").onclick = () =>
+      row.querySelector(".read").onclick = () => {
         sendCmd("read", {name: c.name});
+        row.dataset.awaitName = c.name;
+      };
       const w = row.querySelector(".write");
       if (w) w.onclick = () => {
         const raw = row.querySelector("input").value.trim();

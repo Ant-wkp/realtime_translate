@@ -84,6 +84,7 @@ class TranscriberWorker(threading.Thread):
                 return
             if task.kind == "finish":
                 result = self.provider.finish(task.stream_id)
+                result.meta["final_replaces_partial"] = True
                 self._emit(result, task)
                 return
             result = self.provider.transcribe(task.audio)

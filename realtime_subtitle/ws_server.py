@@ -14,8 +14,9 @@ import queue
 import threading
 from pathlib import Path
 
-import websockets
-from websockets.server import serve
+from websockets.asyncio.server import serve
+from websockets.http11 import Request, Response
+from websockets.datastructures import Headers
 
 
 class BroadcastServer:
@@ -61,12 +62,16 @@ class BroadcastServer:
             finally:
                 self.clients.discard(ws)
 
-        async def http_handler(path, headers):
+        async def http_handler(connection, request: Request):
+            path = request.path
             if path in ("/", "/index.html"):
                 body = (web_dir / "index.html").read_bytes()
-                return (websockets.http11.Response(
-                    200, "OK", headers=[("Content-Type", "text/html; charset=utf-8")]),
-                    body)
+                return Response(
+                    200, "OK",
+                    headers=Headers([("Content-Type", "text/html; charset=utf-8"),
+                                     ("Content-Length", str(len(body)))]),
+                    body=body,
+                )
             return None  # fall back -> 404
 
         async with serve(
