@@ -735,6 +735,10 @@ def main(argv=None) -> int:
                         last_speech_at = now
                         current_id = uuid.uuid4().hex[:12]
                         seg_open_at[current_id] = time.monotonic()
+                        # start a fresh DOA tally: the reported direction must
+                        # describe this utterance, and the counter is what
+                        # flush_segment() reads back via locator.mode()
+                        locator.reset()
                         # take the whole pre-roll window as the seed audio:
                         # the online model's own prev_samples buffer is then
                         # already past one 600ms stride, so the opening words

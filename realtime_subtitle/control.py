@@ -85,8 +85,19 @@ class ControlHandler:
         return {"zones": self.locator.get_zones()}
 
     def cmd_set_zones(self, payload) -> dict:
+        """Accept either labelled ranges or bare labels.
+
+        The range form is what the settings drawer sends; the bare-label form
+        stays supported so an even split can still be requested by hand.
+        """
         zones = payload.get("zones")
         if not isinstance(zones, list) or not zones:
             raise ValueError("zones must be a non-empty list")
-        self.locator.set_zones([str(z) for z in zones])
+        if all(isinstance(z, dict) for z in zones):
+            self.locator.set_zones_from_dicts(zones)
+        else:
+            from .speaker_locator import zones_from_labels
+
+            labels = [str(z) for z in zones if str(z).strip()]
+            self.locator.set_zones(zones_from_labels(labels))
         return {"zones": self.locator.get_zones()}
