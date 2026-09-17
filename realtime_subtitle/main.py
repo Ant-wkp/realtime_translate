@@ -179,24 +179,43 @@ class FinalDecodeThread(threading.Thread):
             except queue.Empty:
                 continue
             start = time.monotonic()
+            mode = "2pass-final"
+            language = ""
             try:
                 res = self.provider.transcribe(job["audio"])
-                result = AsrResult(
-                    text=res.text,
-                    language=res.language,
-                    latency=time.monotonic() - start,
-                    meta={
-                        "engine": self.provider.name,
-                        "mode": "2pass-final",
-                        "task_id": job["task_id"],
-                        "doa": job["doa"],
-                        "final_replaces_partial": True,
-                        "partial_hint": job["partial_hint"],
-                    },
-                )
-                self.on_result(result)
+                text = (res.text or "").strip()
+                language = res.language
             except Exception as exc:  # noqa: BLE001
                 print(f"[ASR] final decode {job['task_id']} failed: {exc}")
+                text = ""
+                mode = "2pass-final-failed"
+
+            # The offline pass can legitimately return nothing (very short or
+            # noisy audio) even though the online pass already recognized
+            # something. The card on screen was created by that partial, so
+            # the final result has to close it out one way or another - a
+            # final that never arrives leaves the text blinking forever.
+            # Promote the streaming partial rather than emitting an empty
+            # result for the caller to drop.
+            if not text:
+                text = (job["partial_hint"] or "").strip()
+                if text:
+                    mode = "2pass-final-partial"
+
+            result = AsrResult(
+                text=text,
+                language=language,
+                latency=time.monotonic() - start,
+                meta={
+                    "engine": self.provider.name,
+                    "mode": mode,
+                    "task_id": job["task_id"],
+                    "doa": job["doa"],
+                    "final_replaces_partial": True,
+                    "partial_hint": job["partial_hint"],
+                },
+            )
+            self.on_result(result)
 
     def stop(self) -> None:
         self._stop.set()
@@ -565,7 +584,11 @@ def main(argv=None) -> int:
         pre_roll_samples = 0
         return audio
 
-    def flush_segment() -> None:
+    def flush_segment() -> bool:
+        """End the current segment. Returns True if it was handed to ASR,
+        False if a filter rejected it (in which case it has already been
+        aborted and the frontend told to drop the card).
+        """
         nonlocal speaking, utterance, hw_speech_ticks, sw_speech_frames
         nonlocal total_frames, prob_sum, max_prob, current_id, stream_opened
         nonlocal silence_low_ticks, speech_samples
@@ -580,15 +603,17 @@ def main(argv=None) -> int:
         # by a long quiet tail must not be diluted into a discard
         voiced_span_frames = total_frames - silent_tail_frames
         voiced_prob = prob_sum - silent_tail_prob
-        seg_id = current_id
-        current_id = ""
-        was_stream = stream_opened
-        stream_opened = False
 
+        # current_id and stream_opened deliberately stay set while the filters
+        # run: discard_segment() needs both to abort the streaming session and
+        # to tell the frontend to drop the card, and it clears them itself.
+        # Clearing them here first (as this used to) made the abort and the
+        # discard broadcast silent no-ops, so a rejected segment left its
+        # partial text on screen with no translation ever arriving.
         # level 1: duration
         if duration < args.min_seconds:
             discard_segment(f"duration {duration:.2f}s < min {args.min_seconds}s")
-            return
+            return False
         # level 2: speech ratio (denominator excludes trailing silence)
         ratio = sw_speech_frames / voiced_span_frames if voiced_span_frames else 0.0
         avg_prob = voiced_prob / voiced_span_frames if voiced_span_frames else 0.0
@@ -599,12 +624,18 @@ def main(argv=None) -> int:
                   f"max_prob={max_prob:.2f} exempt={exempt} hw_ticks={hw_speech_ticks}")
         if ratio < RATIO_THRESHOLD and not exempt:
             discard_segment(f"ratio {ratio:.2f} < {RATIO_THRESHOLD} (avg_prob={avg_prob:.2f})")
-            return
+            return False
         # level 3: energy (trim trailing silence, then floor RMS)
         audio = _trim_tail(audio)
         if audio.size and float(np.sqrt(np.mean(audio ** 2))) < np.sqrt(TRIM_TAIL_ENERGY):
             discard_segment(f"energy {float(np.sqrt(np.mean(audio ** 2)))**2:.2e} < {TRIM_TAIL_ENERGY:.2e}")
-            return
+            return False
+
+        # every filter passed: take ownership of the segment and hand it on
+        seg_id = current_id
+        current_id = ""
+        was_stream = stream_opened
+        stream_opened = False
 
         if was_stream and seg_id:
             transcriber.stream_finish(seg_id, task_id=seg_id, doa=locator.mode())
@@ -622,6 +653,7 @@ def main(argv=None) -> int:
         speaking = False
         silence_low_ticks = 0
         sw_vad.reset()
+        return True
 
     def _trim_tail(audio: np.ndarray) -> np.ndarray:
         n = audio.size
@@ -767,8 +799,13 @@ def main(argv=None) -> int:
                         seg_id_before_flush = current_id
                         print(f"[seg] flush after {now - seg_start:.2f}s "
                               f"(tail wait {silence:.2f}s)")
-                        flush_segment()
-                        if seg_id_before_flush:
+                        delivered = flush_segment()
+                        # Timing anchors are only meaningful for segments that
+                        # actually reach ASR. A rejected segment already aborted
+                        # its stream and told the frontend to drop the card, so
+                        # recording anchors here would leak entries that no
+                        # result will ever pop.
+                        if delivered and seg_id_before_flush:
                             speech_end_at[seg_id_before_flush] = time.monotonic()
                             seg_durations[seg_id_before_flush] = now - seg_start
                             seg_open_at.pop(seg_id_before_flush, None)
@@ -811,23 +848,34 @@ def main(argv=None) -> int:
                     except queue.Empty:
                         break
                     task_id = result.meta.get("task_id", "")
-                    if not result.text:
-                        continue
                     is_final = bool(result.meta.get("final_replaces_partial"))
+                    # Timing anchors are single-use: pop them as soon as the
+                    # segment's result shows up, whichever branch handles it,
+                    # so nothing accumulates for discarded or empty segments.
+                    speech_end = speech_end_at.pop(task_id, None) if is_final else None
+                    seg_len = seg_durations.pop(task_id, None) if is_final else None
+                    if not result.text:
+                        # Nothing usable came out of this utterance. A card
+                        # only exists if a partial was already broadcast for
+                        # this id, and silently skipping would leave that card
+                        # on screen with its cursor blinking and no translation
+                        # ever arriving - so tell the frontend to drop it.
+                        if is_final:
+                            server.broadcast({"type": "discard", "id": task_id,
+                                              "ts": time.time()})
+                        continue
                     print(f"[asr] {task_id} final={is_final} "
+                          f"mode={result.meta.get('mode', '')} "
                           f"decode={result.latency * 1000:.0f}ms "
                           f"text={result.text[:40]!r}")
                     # terminal-only latency stat (old-version format): the
                     # final text replacing the partial marks "source on
                     # screen" for this utterance
-                    if is_final:
-                        speech_end = speech_end_at.get(task_id)
-                        seg_len = seg_durations.pop(task_id, None)
-                        if speech_end is not None:
-                            src_e2e = time.monotonic() - speech_end
-                            seg_txt = f" (段时长 {seg_len:.2f}s)" if seg_len else ""
-                            print(f"[耗时] {task_id[:8]} 说完→原文上屏: "
-                                  f"{src_e2e:.2f}s{seg_txt}")
+                    if is_final and speech_end is not None:
+                        src_e2e = time.monotonic() - speech_end
+                        seg_txt = f" (段时长 {seg_len:.2f}s)" if seg_len else ""
+                        print(f"[耗时] {task_id[:8]} 说完→原文上屏: "
+                              f"{src_e2e:.2f}s{seg_txt}")
                     # The ASR engine's own `language` field describes what it
                     # emits (FunASR always reports "zh"), not what it heard, so
                     # the card label and the translation direction are both
