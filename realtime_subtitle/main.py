@@ -254,6 +254,18 @@ def parse_args(argv=None):
                         "so the model decodes the opening words immediately "
                         "instead of waiting 600ms for a full chunk")
     p.add_argument("--beam-recon", action="store_true", help="read-only beam probe then exit")
+    p.add_argument("--beam-probe", action="store_true",
+                   help="read-only survey of every beam parameter then exit")
+    p.add_argument("--beam-fixed", nargs=2, type=float, metavar=("AZ1", "AZ2"),
+                   default=None,
+                   help="steer the two fixed beams to these azimuths (degrees, "
+                        "0 = array front) and enable energy gating")
+    p.add_argument("--beam-fixed-no-gating", action="store_true",
+                   help="with --beam-fixed, leave both beams live instead of "
+                        "letting speech energy silence the inactive one")
+    p.add_argument("--beam-apply-in-run", action="store_true",
+                   help="keep the fixed-beam steering applied while subtitles "
+                        "run (default is to steer, report and restore)")
     p.add_argument("--beam-select", action="store_true", help="apply beam route then exit")
     p.add_argument("--list-devices", action="store_true")
     p.add_argument("--debug-gate", action="store_true",
@@ -324,6 +336,40 @@ def main(argv=None) -> int:
         print("[USB] XVF3800 control plane connected")
     except Exception as exc:  # noqa: BLE001
         print(f"[USB] control plane unavailable: {exc}")
+
+    if args.beam_probe:
+        if device is None:
+            print("[beam] probe requires the USB control plane")
+            return 1
+        from .beam_router import FixedBeamController
+
+        survey = FixedBeamController(device).probe()
+        for name, val in survey.items():
+            print(f"[beam] {name} = {val}")
+        return 0
+
+    beam_controller = None
+    if args.beam_fixed is not None:
+        if device is None:
+            print("[beam] fixed-beam steering requires the USB control plane")
+            return 1
+        from .beam_router import FixedBeamController
+
+        beam_controller = FixedBeamController(device)
+        result = beam_controller.steer(
+            args.beam_fixed[0], args.beam_fixed[1],
+            gating=not args.beam_fixed_no_gating)
+        print(f"[beam] steer {args.beam_fixed} gating="
+              f"{not args.beam_fixed_no_gating} -> {result}")
+        if not result.get("ok"):
+            return 1
+        if not args.beam_apply_in_run:
+            # report, then hand the array back exactly as it was found: a
+            # measurement run must not leave the beams pointing somewhere the
+            # operator never chose
+            print(f"[beam] restoring original beam config: "
+                  f"{beam_controller.restore()}")
+            beam_controller = None
 
     if args.beam_recon or args.beam_select:
         if device is None:
@@ -921,6 +967,10 @@ def main(argv=None) -> int:
                   + (f", 另 {fmiss} 句太短无 partial" if fmiss else ""))
         if vad_reader:
             vad_reader.stop()
+        # put the beam configuration back if we were holding a steering change
+        if beam_controller is not None:
+            print(f"[beam] restoring original beam config: "
+                  f"{beam_controller.restore()}")
         transcriber.stop()
         final_decode.stop()
         translation.stop()
