@@ -34,17 +34,27 @@ header{
   backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
   border-bottom:1px solid var(--border);
 }
-.logo{width:26px;height:26px;border-radius:8px;
-  background:linear-gradient(135deg,var(--accent),var(--accent-2));
+.logo{width:26px;height:26px;border-radius:50%;box-sizing:border-box;
+  border:2px solid var(--accent);
   animation:breathe 3.2s ease-in-out infinite}
-@keyframes breathe{0%,100%{opacity:.75;transform:scale(.96)}50%{opacity:1;transform:scale(1)}}
+@keyframes breathe{0%,100%{opacity:.75;transform:scale(.96)}
+  50%{opacity:1;transform:scale(1.04)}}
 header h1{font-size:1rem;font-weight:600;letter-spacing:.02em}
 .spacer{flex:1}
 #dot{width:9px;height:9px;border-radius:50%;background:#64748b;transition:background .3s;
   box-shadow:0 0 10px transparent}
 #dot.on{background:var(--ok);box-shadow:0 0 12px var(--ok);animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
-#gate{font-size:.72rem;color:var(--text-dim);min-width:5.2em}
+#gate{display:flex;align-items:flex-end;gap:2.5px;height:16px;opacity:.3;
+  transition:opacity .35s ease;min-width:2.4em}
+#gate i{width:3px;height:5px;border-radius:2px;background:var(--text-dim);
+  transition:background .35s ease}
+#gate.on{opacity:1}
+#gate.on i{background:var(--accent);animation:eq .9s ease-in-out infinite}
+#gate.on i:nth-child(2){animation-delay:.13s}
+#gate.on i:nth-child(3){animation-delay:.26s}
+#gate.on i:nth-child(4){animation-delay:.39s}
+@keyframes eq{0%,100%{height:5px}50%{height:15px}}
 #gear{width:36px;height:36px;border:1px solid var(--border);border-radius:10px;
   background:var(--glass);color:var(--text);cursor:pointer;display:grid;place-items:center;
   transition:transform .35s ease, background .2s}
@@ -52,11 +62,33 @@ header h1{font-size:1rem;font-weight:600;letter-spacing:.02em}
 #gear svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6}
 main{max-width:860px;margin:0 auto;padding:1.1rem 1rem 6rem;display:flex;
   flex-direction:column;gap:.8rem}
-#empty{display:flex;flex-direction:column;align-items:center;gap:1rem;
-  padding:5rem 0;color:var(--text-dim)}
-#empty .ring{width:64px;height:64px;border-radius:50%;border:2px solid var(--border);
-  border-top-color:var(--accent);animation:spin 2.4s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
+#empty{display:flex;flex-direction:column;align-items:center;gap:1.35rem;
+  padding:6rem 0;color:var(--text-dim)}
+/* breathing wait ring: a single hollow ring that inhales and exhales, with
+   two ripple halos trailing behind. No rotation and no filled centre, so it
+   reads as "listening" rather than "loading" */
+#empty .ring{position:relative;width:76px;height:76px;border-radius:50%;
+  box-sizing:border-box;border:2px solid rgba(76,201,240,.6);
+  animation:ring-breathe 3.8s ease-in-out infinite}
+#empty .ring::before,#empty .ring::after{content:"";position:absolute;
+  inset:-2px;border-radius:50%;border:1px solid rgba(76,201,240,.38);
+  animation:ring-ripple 3.8s ease-out infinite}
+#empty .ring::after{animation-delay:1.9s}
+@keyframes ring-breathe{
+  0%,100%{transform:scale(.88);opacity:.45;
+    box-shadow:0 0 0 0 rgba(76,201,240,0),inset 0 0 0 0 rgba(76,201,240,0)}
+  50%{transform:scale(1.06);opacity:1;
+    box-shadow:0 0 22px 2px rgba(76,201,240,.22),
+      inset 0 0 14px 1px rgba(76,201,240,.16)}
+}
+@keyframes ring-ripple{
+  0%{transform:scale(1);opacity:.45}
+  100%{transform:scale(1.75);opacity:0}
+}
+@media(prefers-reduced-motion:reduce){
+  #empty .ring,#empty .ring::before,#empty .ring::after{
+    animation-duration:6s}
+}
 .card{
   position:relative;background:var(--glass);
   backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
@@ -69,8 +101,15 @@ main{max-width:860px;margin:0 auto;padding:1.1rem 1rem 6rem;display:flex;
   border-radius:3px;background:linear-gradient(180deg,var(--accent),var(--accent-2))}
 .meta{display:flex;align-items:center;gap:.5rem;margin-bottom:.45rem;flex-wrap:wrap}
 .pill{font-size:.68rem;padding:.14rem .55rem;border-radius:99px;color:var(--accent);
-  background:rgba(76,201,240,.10);border:1px solid rgba(76,201,240,.28)}
+  background:rgba(76,201,240,.10);border:1px solid rgba(76,201,240,.28);
+  white-space:nowrap}
 .pill.src{color:#fbbf24;background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.25)}
+/* per-sentence speaker direction, filled in when the segment closes */
+.pill.doa{color:#34d399;background:rgba(52,211,153,.09);
+  border-color:rgba(52,211,153,.28);display:inline-flex;align-items:center;
+  gap:.3em}
+.pill.doa::before{content:"";width:5px;height:5px;border-radius:50%;
+  background:currentColor;box-shadow:0 0 6px currentColor}
 .src-text{font-size:1.02rem;line-height:1.55}
 .trans{margin-top:.5rem;padding-top:.5rem;border-top:1px dashed var(--border);
   font-size:.98rem;line-height:1.5;color:var(--accent)}
@@ -80,6 +119,9 @@ main{max-width:860px;margin:0 auto;padding:1.1rem 1rem 6rem;display:flex;
   vertical-align:-0.15em;background:var(--accent);
   animation:blink 1s steps(1) infinite;border-radius:2px}
 @keyframes blink{0%,55%{opacity:1}56%,100%{opacity:0}}
+/* an explicit display on a class would otherwise beat the UA rule for the
+   hidden attribute, leaving an empty pill's dot on screen */
+[hidden]{display:none !important}
 .trans .lang{font-size:.66rem;font-family:ui-monospace,Consolas,monospace;
   color:var(--text-dim);margin-left:.4rem}
 /* drawer */
@@ -91,52 +133,80 @@ main{max-width:860px;margin:0 auto;padding:1.1rem 1rem 6rem;display:flex;
   border-left:1px solid var(--border);transform:translateX(102%);transition:transform .32s ease;
   overflow-y:auto;padding:1.2rem 1.1rem 2rem}
 #drawer.show{transform:none}
-#drawer h2{font-size:.95rem;margin-bottom:.2rem}
-#drawer .sub{font-size:.72rem;color:var(--text-dim);margin-bottom:1rem}
-.section{margin-top:1.2rem}
-.section h3{font-size:.8rem;color:var(--text-dim);margin-bottom:.55rem;display:flex;
-  align-items:center;gap:.45rem}
+#drawer h2{font-size:1rem;font-weight:600;letter-spacing:.01em}
+#drawer .sub{font-size:.72rem;color:var(--text-dim);margin-bottom:.2rem}
+.section{margin-top:1.4rem;padding-top:1.1rem;border-top:1px solid var(--border)}
+.section:first-of-type{border-top:0;padding-top:0}
+.section h3{font-size:.74rem;color:var(--text-dim);margin-bottom:.65rem;display:flex;
+  align-items:center;gap:.45rem;text-transform:uppercase;letter-spacing:.09em}
 .badge{font-size:.6rem;padding:.08rem .4rem;border-radius:99px;background:rgba(251,146,60,.15);
-  color:#fb923c;border:1px solid rgba(251,146,60,.3)}
-select,input[type=text]{
+  color:#fb923c;border:1px solid rgba(251,146,60,.3);text-transform:none;letter-spacing:0}
+/* language row: a label and its select share one line so the drawer reads as
+   a settings list instead of a stack of full-width controls */
+.field{display:flex;align-items:center;gap:.6rem;margin-bottom:.5rem}
+.field label{flex:0 0 5.4em;font-size:.74rem;color:var(--text-dim)}
+.field select{margin:0;flex:1}
+select,input[type=text],input[type=number]{
   width:100%;padding:.5rem .6rem;margin-bottom:.55rem;border-radius:9px;color:var(--text);
   background:rgba(255,255,255,.05);border:1px solid var(--border);outline:none;font-size:.85rem;
   transition:border-color .2s, background .2s;
 }
-select:hover,input[type=text]:hover{border-color:rgba(255,255,255,.28)}
-select:focus,input[type=text]:focus{border-color:var(--accent)}
+select:hover,input[type=text]:hover,input[type=number]:hover{border-color:rgba(255,255,255,.28)}
+select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--accent)}
 .btn{padding:.55rem 1rem;border:none;border-radius:9px;cursor:pointer;font-size:.83rem;
   font-weight:600;color:#06121f;background:linear-gradient(135deg,var(--accent),#5eead4);
   transition:filter .2s, transform .1s}
 .btn:hover{filter:brightness(1.08)}
 .btn:active{transform:scale(.98)}
 .btn.ghost{background:var(--glass-strong);color:var(--text);border:1px solid var(--border)}
-.row{display:flex;gap:.5rem;align-items:center}
-.row input[type=text]{flex:1;margin:0}
-.del{width:32px;height:32px;border:1px solid var(--border);border-radius:8px;
+/* the primary action of each section sits right-aligned and sized to content */
+.section .actions{display:flex;justify-content:flex-end;gap:.45rem;margin-top:.7rem}
+.section .actions .btn{padding:.42rem .95rem;font-size:.76rem}
+/* zone editor: label plus its azimuth range; a start greater than the end
+   means the range wraps past 360° */
+.zrow{display:grid;grid-template-columns:1.2em 1fr 3.6em 3.6em 30px;
+  gap:.35rem;align-items:center;margin-bottom:.4rem}
+.zrow .zlabel{min-width:0}
+.zrow input{width:100%;margin:0;padding:.34rem .4rem;border-radius:7px;
+  font-size:.72rem}
+.zrow input[type=text]{text-align:left;font-family:inherit}
+.zrow input[type=number]{text-align:right;font-family:ui-monospace,Consolas,monospace;
+  -moz-appearance:textfield;appearance:textfield;color-scheme:dark}
+/* the spinners are unreadable on the dark background, and these fields are
+   typed rather than nudged */
+.zrow input[type=number]::-webkit-outer-spin-button,
+.zrow input[type=number]::-webkit-inner-spin-button{
+  -webkit-appearance:none;margin:0}
+.del{width:30px;height:30px;flex:0 0 auto;border:1px solid var(--border);border-radius:8px;
   background:transparent;color:var(--text-dim);cursor:pointer;display:grid;place-items:center;
   transition:all .2s}
 .del:hover{color:var(--err);border-color:rgba(248,113,113,.4)}
-#advToggle{width:100%;text-align:left;padding:.5rem .6rem;border-radius:9px;
+#advToggle{width:100%;text-align:left;padding:.55rem .65rem;border-radius:9px;
   background:var(--glass);border:1px solid var(--border);color:var(--text);
-  cursor:pointer;font-size:.8rem;display:flex;align-items:center;gap:.5rem}
+  cursor:pointer;font-size:.8rem;display:flex;align-items:center;gap:.5rem;
+  transition:background .2s}
+#advToggle:hover{background:var(--glass-strong)}
 #advBody{display:none;margin-top:.6rem}
 #advBody.open{display:block}
-.advgroup{margin-bottom:.7rem;border:1px solid var(--border);border-radius:10px;overflow:hidden}
-.advgroup .ghead{padding:.45rem .6rem;background:var(--glass-strong);font-size:.72rem;
-  color:var(--text-dim);cursor:pointer;display:flex;justify-content:space-between}
-.advgroup .gbody{display:none;padding:.5rem .6rem}
+.advgroup{margin-bottom:.6rem;border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.advgroup .ghead{position:relative;padding:.5rem .65rem;background:var(--glass-strong);
+  font-size:.72rem;color:var(--text);cursor:pointer;display:flex;
+  justify-content:space-between;align-items:center;gap:.5rem}
+.advgroup .gbody{display:none;padding:.5rem .65rem}
 .advgroup.open .gbody{display:block}
-.cmd{display:flex;gap:.45rem;align-items:center;padding:.3rem 0;font-size:.72rem;
+.cmd{display:flex;gap:.45rem;align-items:center;padding:.32rem 0;font-size:.72rem;
   font-family:ui-monospace,Consolas,monospace}
-.cmd .cname{flex:1;color:var(--text)}
+.cmd .cname{flex:1;color:var(--text);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
 .cmd .val{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   color:var(--accent);font-size:.64rem}
 .cmd .ro{font-size:.58rem;color:var(--text-dim)}
 .cmd input{width:110px;padding:.28rem .4rem;margin:0;border-radius:6px;font-size:.68rem}
 .mini{padding:.28rem .55rem;border:none;border-radius:6px;cursor:pointer;font-size:.66rem;
-  background:rgba(255,255,255,.1);color:var(--text)}
+  background:rgba(255,255,255,.1);color:var(--text);transition:background .2s}
 .mini:hover{background:rgba(255,255,255,.2)}
+.mini.icon{width:24px;padding:.28rem 0;display:grid;place-items:center;font-size:.8rem;
+  line-height:1}
 #toast{position:fixed;left:50%;bottom:2rem;transform:translate(-50%,150%);
   z-index:12;max-width:78vw;padding:.6rem 1.1rem;border-radius:10px;font-size:.82rem;
   background:rgba(15,20,36,.95);border:1px solid var(--border);color:var(--text);
@@ -155,7 +225,7 @@ select:focus,input[type=text]:focus{border-color:var(--accent)}
   <div class="logo"></div>
   <h1>reSpeaker 实时双语字幕</h1>
   <div class="spacer"></div>
-  <span id="gate">--</span>
+  <div id="gate" title="语音活动"><i></i><i></i><i></i><i></i></div>
   <div id="dot" title="连接状态"></div>
   <button id="gear" title="设置">
     <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/>
@@ -170,21 +240,30 @@ select:focus,input[type=text]:focus{border-color:var(--accent)}
 <aside id="drawer">
   <h2>设置</h2>
   <div class="sub">运行时配置立即生效</div>
+
   <div class="section">
     <h3>翻译方向</h3>
-    <label style="font-size:.72rem;color:var(--text-dim)">中文 →</label>
-    <select id="zhTo"></select>
-    <label style="font-size:.72rem;color:var(--text-dim)">其他语言 →</label>
-    <select id="otherTo"></select>
-    <div class="sub" style="margin:.35rem 0 0">语言按字幕文本判定：含假名→日语，
-      含谚文→韩语，含汉字→中文，其余归为英语。识别不到的源语言按“其他语言”处理。</div>
-    <button class="btn" id="saveLangs" style="width:100%;margin-top:.3rem">保存方向</button>
+    <div class="field">
+      <label for="zhTo">中文 →</label>
+      <select id="zhTo"></select>
+    </div>
+    <div class="field">
+      <label for="otherTo">其他语言 →</label>
+      <select id="otherTo"></select>
+    </div>
+    <div class="sub">源语言按字幕文本判定：含假名→日语，含谚文→韩语，
+      含汉字→中文，其余归为英语；识别不到的按“其他语言”处理。</div>
+    <div class="actions"><button class="btn" id="saveLangs">保存方向</button></div>
   </div>
+
   <div class="section">
-    <h3>DOA 方位标签 <button class="mini" id="addZone">＋</button></h3>
+    <h3>DOA 方位标签
+      <button class="mini icon" id="addZone" title="新增方位">＋</button>
+    </h3>
     <div id="zones"></div>
-    <button class="btn ghost" id="saveZones" style="width:100%;margin-top:.6rem">保存标签</button>
+    <div class="actions"><button class="btn ghost" id="saveZones">保存标签</button></div>
   </div>
+
   <div class="section">
     <h3>高级 <span class="badge">设备参数</span></h3>
     <button id="advToggle">▸ USB 命令</button>
@@ -226,9 +305,14 @@ function cardFor(id, partial){
     el = document.createElement("div");
     el.className = "card";
     // streaming phase: blinking cursor, no translation placeholder yet
-    // (the old version showed "翻译中…" only after the final text froze)
+    // (the old version showed "翻译中…" only after the final text froze).
+    // The DOA pill is present but hidden until the segment closes, since the
+    // backend picks the direction only once the utterance has ended.
     el.innerHTML =
-      '<div class="meta"><span class="pill src">partial</span></div>' +
+      '<div class="meta">' +
+        '<span class="pill src">partial</span>' +
+        '<span class="pill doa" hidden></span>' +
+      '</div>' +
       '<div class="src-text"></div>' +
       (partial ? '<span class="cursor"></span>' : '') +
       '<div class="trans"></div>';
@@ -241,6 +325,15 @@ function cardFor(id, partial){
     }
   }
   return el;
+}
+
+function stampDoa(el, doa){
+  const p = el.querySelector(".pill.doa");
+  if (!p) return;
+  if (!doa){ p.hidden = true; return; }
+  p.textContent = "方位 " + doa;
+  p.title = "说话人方位：" + doa;
+  p.hidden = false;
 }
 
 // freezeCard: the utterance is complete - drop the blinking cursor and make
@@ -265,6 +358,7 @@ function handle(msg){
       removeEmpty();
       const el = cardFor(msg.id);
       freezeCard(el, msg.lang);
+      stampDoa(el, msg.doa);
       el.querySelector(".src-text").textContent = msg.text || "";
       scrollIfStuck();
       break;
@@ -273,6 +367,7 @@ function handle(msg){
       removeEmpty();
       const el = cardFor(msg.id);
       freezeCard(el, msg.lang);
+      stampDoa(el, msg.doa);
       el.querySelector(".src-text").textContent = msg.text || "";
       scrollIfStuck();
       break;
@@ -305,10 +400,16 @@ function handle(msg){
       scrollIfStuck();
       break;
     }
-    case "vad.state":
-      $("gate").textContent = (msg.gate_mode || "--") +
-        (msg.hw_vad ? " · 说" : " · 静");
+    case "vad.state": {
+      // a small level meter instead of the "and · 静" text: silence shows a
+      // dim resting bar, speech lifts the bars and tints them
+      const g = $("gate");
+      const active = msg.segment_state === "SPEAKING" || !!msg.hw_vad;
+      g.classList.toggle("on", active);
+      g.title = "语音活动：" + (active ? "说话中" : "静音") +
+        "（门控 " + (msg.gate_mode || "?") + "）";
       break;
+    }
     case "cmd_result":
       if (msg.ok === false) toast("命令失败: " + (msg.error || ""), "err");
       break;
@@ -344,18 +445,48 @@ function renderTargets(data){
       ">" + esc(label) + "</option>").join("");
   }
 }
-function zoneRow(label){
+function zoneRow(z, index){
   const div = document.createElement("div");
-  div.className = "row";
-  div.innerHTML = '<input type="text" value="' + esc(label) + '">' +
+  div.className = "zrow";
+  div.innerHTML =
+    '<span class="idx">' + (index || 1) + "</span>" +
+    '<input type="text" class="zlabel" value="' + esc(z.label) + '" placeholder="标签">' +
+    '<input type="number" class="zstart" min="0" max="359" step="1" value="' + z.start +
+      '" title="起点角度，0° = 阵列正前方，顺时针">' +
+    '<input type="number" class="zend" min="0" max="359" step="1" value="' + z.end +
+      '" title="终点角度，可小于起点表示跨越 360°">' +
     '<button class="del" title="删除">✕</button>';
-  div.querySelector(".del").onclick = () => div.remove();
+  div.querySelector(".del").onclick = () => { div.remove(); renumberZones(); };
   return div;
+}
+function renumberZones(){
+  [...document.querySelectorAll("#zones .zrow .idx")]
+    .forEach((s, i) => { s.textContent = i + 1; });
+}
+function readZones(){
+  return [...document.querySelectorAll("#zones .zrow")].map(r => ({
+    label: r.querySelector(".zlabel").value.trim(),
+    start: parseFloat(r.querySelector(".zstart").value) || 0,
+    end: parseFloat(r.querySelector(".zend").value) || 0
+  })).filter(z => z.label);
 }
 function renderZones(data){
   const box = $("zones");
   box.innerHTML = "";
-  (data.zones || []).forEach(z => box.appendChild(zoneRow(z)));
+  const zones = (data.zones || []).map(z =>
+    (typeof z === "object" && z !== null)
+      ? {label: String(z.label ?? ""), start: Number(z.start) || 0, end: Number(z.end) || 0}
+      : {label: String(z), start: 0, end: 0});
+  // a bare-label payload carries no ranges; spread them evenly rather than
+  // stacking every row on 0-0
+  if (zones.length && zones.every(z => z.start === 0 && z.end === 0)){
+    const step = 360 / zones.length;
+    zones.forEach((z, i) => {
+      z.start = Math.round(i * step);
+      z.end = Math.round((i + 1) * step);
+    });
+  }
+  zones.forEach((z, i) => box.appendChild(zoneRow(z, i + 1)));
 }
 function renderCommandGroups(data){
   const body = $("advBody");
@@ -437,16 +568,22 @@ $("saveLangs").onclick = () => {
   sendCmd("set_target_langs", {zh_to: $("zhTo").value, other_to: $("otherTo").value});
   toast("翻译方向已保存", "ok");
 };
-$("addZone").onclick = () => $("zones").appendChild(zoneRow(""));
+$("addZone").onclick = () => {
+  const n = document.querySelectorAll("#zones .zrow").length;
+  // a new row claims no degrees until the user fills in a range
+  $("zones").appendChild(zoneRow({label: "", start: 0, end: 0}, n + 1));
+};
 $("saveZones").onclick = () => {
-  const zones = [...document.querySelectorAll("#zones input")].map(i => i.value.trim()).filter(Boolean);
+  const zones = readZones();
+  if (!zones.length){ toast("至少需要一个方位标签", "err"); return; }
   sendCmd("set_zones", {zones});
   toast("方位标签已保存", "ok");
 };
 $("advToggle").onclick = () => {
   const b = $("advBody");
   b.classList.toggle("open");
-  $("advToggle").textContent = (b.classList.contains("open") ? "▾ " : "▸ ") + "USB 命令";
+  $("advToggle").textContent =
+    (b.classList.contains("open") ? "▾ " : "▸ ") + "USB 命令";
 };
 
 connect();
