@@ -4,11 +4,16 @@ Commands arrive from the WebSocket cmd_queue and are executed by the main
 loop (phase 5). Heavy work stays in the callers' own threads; this module
 only translates and dispatches. Unknown languages and failed device
 operations return explicit errors instead of silent fallbacks.
+
+Configuration is volatile by policy: the commands that would persist it to
+flash, or reset the device outright, are listed in usb_device and refused
+here with an explanation rather than being passed down.
 """
 
 from __future__ import annotations
 
-from .usb_device import PARAMETERS, RESID_GROUPS
+from .usb_device import (DISRUPTIVE_CMDS, FLASH_PERSIST_CMDS, PARAMETERS,
+                         RESID_GROUPS)
 
 
 class ControlHandler:
@@ -34,11 +39,23 @@ class ControlHandler:
         groups = {}
         for name, (resid, cmdid, count, access, ptype, desc) in PARAMETERS.items():
             gname = RESID_GROUPS.get(resid, f"resid_{resid}")
-            groups.setdefault(gname, []).append(
-                {"name": name, "resid": resid, "cmdid": cmdid,
-                 "count": count, "type": ptype, "access": access,
-                 "description": desc}
-            )
+            entry = {"name": name, "resid": resid, "cmdid": cmdid,
+                     "count": count, "type": ptype, "access": access,
+                     "description": desc}
+            # Tell the UI which rows are deliberately not writable, so it can
+            # disable them instead of offering a control that would fail.
+            if name in FLASH_PERSIST_CMDS:
+                entry["blocked"] = True
+                entry["block_reason"] = (
+                    "会写入 flash 持久化配置，本项目禁止（持久化的波束开关可能"
+                    "导致设备重启后挂起）"
+                )
+            elif name in DISRUPTIVE_CMDS:
+                entry["blocked"] = True
+                entry["block_reason"] = (
+                    "会重启设备或重置全部参数，会丢弃本次运行建立的配置，本项目禁止"
+                )
+            groups.setdefault(gname, []).append(entry)
         return {"groups": groups}
 
     def cmd_read(self, payload) -> dict:
@@ -58,6 +75,20 @@ class ControlHandler:
             raise ValueError(f"unknown parameter: {name}")
         if PARAMETERS[name][3] == "ro":
             raise ValueError(f"{name} is read-only")
+        # The menu offers these, so a stray console call could reach them.
+        # Rejecting here with an explanation is friendlier than letting
+        # ReSpeaker.write() raise a PermissionError deeper down.
+        if name in FLASH_PERSIST_CMDS:
+            raise ValueError(
+                f"{name} would save the configuration to flash and is blocked: "
+                f"a persisted beam setting can hang the device on reboot. "
+                f"Settings are applied per run instead."
+            )
+        if name in DISRUPTIVE_CMDS:
+            raise ValueError(
+                f"{name} reboots or resets the device and is blocked, because "
+                f"it would drop the configuration this run applied."
+            )
         if value is None:
             raise ValueError("value required")
         self.device.write(name, value)

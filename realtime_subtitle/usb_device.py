@@ -185,6 +185,30 @@ PARAMETERS = {
     "PP_ATTNS_SLOPE": (17, 34, 1, "rw", "float", "Extra suppression during non-speech vs AGC level [0.0 .. 5.0]"),
 }
 
+# Commands that persist the running configuration into flash. Writing any of
+# these freezes whatever is currently in RAM as the power-on default, so a
+# beam left switched on would come back switched on after a reboot - which the
+# firmware documentation warns can hang the device (AEC_FIXEDBEAMSONOFF is only
+# meant to be set at runtime). This project therefore never persists: the
+# running configuration is deliberately volatile, and settings are reapplied
+# on each start instead. See ReSpeaker.write().
+FLASH_PERSIST_CMDS = frozenset({
+    "SAVE_CONFIGURATION",
+    "CLEAR_CONFIGURATION",
+})
+
+# Commands that reboot the chip or reset parameters to their defaults. They
+# would silently discard the beam configuration this program is holding, so
+# they are refused for the same reason: the only configuration anyone should
+# see is the one this run established.
+DISRUPTIVE_CMDS = frozenset({
+    "REBOOT",
+    "USB_BIT_DEPTH",
+    "TEST_CORE_BURN",
+})
+
+GUARDED_CMDS = FLASH_PERSIST_CMDS | DISRUPTIVE_CMDS
+
 
 def find():
     """Locate the XVF3800 device.
@@ -266,7 +290,27 @@ class ReSpeaker:
         size = count * _TYPE_SIZE[ptype]
         return list(struct.unpack("<" + _FMT[ptype] * count, raw[:size]))
 
-    def write(self, name: str, value) -> None:
+    def write(self, name: str, value, allow_persist: bool = False) -> None:
+        """Write one parameter.
+
+        `allow_persist` exists so the refusal below is a deliberate, greppable
+        decision rather than something a future caller can trip over by
+        accident. No caller in this project passes it: see FLASH_PERSIST_CMDS
+        for why the configuration is kept volatile on purpose.
+        """
+        if name in GUARDED_CMDS and not allow_persist:
+            if name in FLASH_PERSIST_CMDS:
+                raise PermissionError(
+                    f"{name} writes the configuration to flash and is refused "
+                    f"by design: persisting a runtime parameter such as "
+                    f"AEC_FIXEDBEAMSONOFF can make the device hang on the next "
+                    f"boot. Settings are reapplied at each start instead."
+                )
+            raise PermissionError(
+                f"{name} reboots the chip or resets all parameters, which "
+                f"would discard the beam configuration this run established; "
+                f"it is refused by design."
+            )
         _, _, count, access, ptype, _ = PARAMETERS[name]
         if access == "ro":
             raise ValueError(f"{name} is read-only")

@@ -201,6 +201,11 @@ select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--
 .cmd .val{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   color:var(--accent);font-size:.64rem}
 .cmd .ro{font-size:.58rem;color:var(--text-dim)}
+/* deliberately unavailable commands (flash persist / device reset) */
+.cmd .ralert{font-size:.58rem;color:#fb923c;border:1px solid rgba(251,146,60,.35);
+  background:rgba(251,146,60,.12);border-radius:99px;padding:.06rem .38rem;
+  white-space:nowrap;cursor:help}
+.cmd input:disabled{opacity:.35;cursor:not-allowed}
 .cmd input{width:110px;padding:.28rem .4rem;margin:0;border-radius:6px;font-size:.68rem}
 .mini{padding:.28rem .55rem;border:none;border-radius:6px;cursor:pointer;font-size:.66rem;
   background:rgba(255,255,255,.1);color:var(--text);transition:background .2s}
@@ -502,13 +507,25 @@ function renderCommandGroups(data){
     cmds.forEach(c => {
       const row = document.createElement("div");
       row.className = "cmd";
+      // Commands that persist the configuration to flash, or reset the
+      // device, are shown but not writable here: the backend refuses them
+      // anyway, and the reason belongs next to the control.
+      const blocked = (c.access === "wo") || !!c.blocked;
       row.innerHTML = '<span class="cname">' + esc(c.name) + "</span>" +
+        (c.blocked ? '<span class="ralert" title="' + esc(c.block_reason || "") +
+            '">不可用</span>' : "") +
         '<span class="val"></span>' +
         (c.access === "ro" ? '<span class="ro">ro</span>' :
-          '<input type="text" placeholder="json">') +
+          '<input type="text" placeholder="json"' +
+            (blocked ? " disabled" : "") + ">") +
         '<button class="mini read">读</button>' +
-        (c.access === "rw" ? '<button class="mini write">写</button>' : "");
-      row.querySelector(".read").onclick = () => {
+        (c.access === "rw" && !c.blocked ?
+          '<button class="mini write">写</button>' : "");
+      const rd = row.querySelector(".read");
+      // a write-only command has nothing to read; hide it rather than let
+      // the click fail
+      if (c.access === "wo"){ rd.remove(); }
+      else rd.onclick = () => {
         sendCmd("read", {name: c.name});
         row.dataset.awaitName = c.name;
       };

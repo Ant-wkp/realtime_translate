@@ -18,9 +18,23 @@ from __future__ import annotations
 
 import math
 
-from .usb_device import ReSpeaker
+from .usb_device import GUARDED_CMDS, ReSpeaker
 
 AUDIO_CHANNELS = 6
+
+# Parameters steer() touches. Kept as a named tuple-ish list so the assertion
+# below can check the whole write set at once: if someone later adds a
+# flash-persisting or disruptive command to this sequence, the assert fires
+# before anything reaches the device.
+STEER_WRITES = (
+    "AEC_FIXEDBEAMSAZIMUTH_VALUES",
+    "AEC_FIXEDBEAMSELEVATION_VALUES",
+    "AEC_FIXEDBEAMSGATING",
+    "AEC_FIXEDBEAMSONOFF",          # must stay last: see steer()
+)
+assert not (set(STEER_WRITES) & GUARDED_CMDS), (
+    "steer() must never write a flash-persisting or disruptive command"
+)
 
 RAD_PER_DEG = math.pi / 180.0
 DEG_PER_RAD = 180.0 / math.pi
@@ -109,11 +123,13 @@ class FixedBeamController:
         Gating lets speech energy decide which beam is audible; without it both
         beams stay live and the two voices are summed, which is the problem we
         are trying to avoid, so gating defaults on.
+
+        AEC_FIXEDBEAMSONOFF is written last and deliberately *not* followed by
+        a save: the firmware only supports enabling fixed beams at runtime, and
+        persisting the flag has been reported to hang the device. The setting
+        therefore lasts until the device is reset, and restore() reverses it.
         """
-        for name in ("AEC_FIXEDBEAMSAZIMUTH_VALUES",
-                     "AEC_FIXEDBEAMSELEVATION_VALUES",
-                     "AEC_FIXEDBEAMSGATING",
-                     "AEC_FIXEDBEAMSONOFF"):
+        for name in STEER_WRITES:
             self._remember(name)
 
         want_az = [az1 * RAD_PER_DEG, az2 * RAD_PER_DEG]
@@ -122,6 +138,8 @@ class FixedBeamController:
             self.device.write("AEC_FIXEDBEAMSELEVATION_VALUES",
                               [elev1 * RAD_PER_DEG, elev2 * RAD_PER_DEG])
             self.device.write("AEC_FIXEDBEAMSGATING", [1 if gating else 0])
+            # enabling the beams is the last step, after the geometry they
+            # should use is already in place
             self.device.write("AEC_FIXEDBEAMSONOFF", [1])
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "reason": str(exc), "restored": self.restore()}
