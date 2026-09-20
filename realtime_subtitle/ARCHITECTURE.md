@@ -44,6 +44,9 @@ IDLE → SPEAKING → TRAILING_SILENCE → FLUSH ─┬→ DISCARD（统一丢�
 - pre_roll 无条件喂入（含静音），保证开段瞬间窗口已满；flush/discard 都清空它，否则尾部语音会让下一段流重复解码出可见重复文本
 - 参数：`vad_interval=0.1s`、`silence_hold=0.6s`、`min_seconds=0.3`、`max_seconds=20`、`pre_roll=1.0s`
 - 超长段强制切分；DOA 众数随段保存（仅展示与波束参考，不参与过滤）
+- 实现见 `segmenter.py`：`Segmenter` 持有单个 lane 的全部状态，`feed(chunks, gate_fn, hw_vad, now)` 每次 tick 返回 `Action` 列表（`open`/`feed`/`flush`/`discard`），由 `main.py` 的 `apply_actions()` 翻译成对转录器与前端广播的调用。软 VAD 概率在 `Segmenter` 内部计算一次，同时驱动门控判定、统计与句尾确认，避免同一个 tick 出现多个读数
+- 该文件是纯逻辑、无 I/O，可脱离硬件测试（`tests/test_segmenter.py`）；`trim_tail()` 同时被 flush 的第三层过滤器与最终离线解码复用
+- 日志措辞由 `Segmenter` 生成（`Action.flush_line`/`debug_line`），单 lane 模式下 `tag` 为空，输出与重构前逐字一致
 
 ## 4. 推理层
 
