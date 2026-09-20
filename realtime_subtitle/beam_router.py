@@ -17,6 +17,7 @@ FixedBeamController below, which follows the same save/verify/rollback rule.
 from __future__ import annotations
 
 import math
+import time
 
 from .usb_device import GUARDED_CMDS, ReSpeaker
 
@@ -168,6 +169,85 @@ class FixedBeamController:
                 ok = False
         self._saved.clear()
         return ok
+
+    # ------------------------------------------------------------------
+    def scan(self, step_deg: float = 30.0, settle: float = 0.35) -> dict:
+        """Sweep the beams to find where the speech actually is.
+
+        The array has only two steerable beams, so the sweep puts beam 1 at
+        theta and beam 2 at theta+180 and reads both energies per step: six
+        steps of 30 degrees already cover the full circle twice over. Gating is
+        turned off for the sweep, because gating silences the beam it judges
+        inactive and would zero the very reading we are measuring.
+
+        Ambient noise moves, so the peak is only a hint - the caller decides
+        what to do with it. The device is left exactly as found (the beams and
+        gating are restored) unless the caller keeps the steering via steer().
+        """
+        if step_deg <= 0 or step_deg > 180:
+            return {"ok": False, "reason": "step must be within (0, 180)"}
+
+        for name in STEER_WRITES:
+            self._remember(name)
+        try:
+            self.device.write("AEC_FIXEDBEAMSGATING", [0])
+            self.device.write("AEC_FIXEDBEAMSONOFF", [1])
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "reason": str(exc), "restored": self.restore()}
+
+        steps: list[dict] = []
+        try:
+            angle = 0.0
+            while angle < 360.0:
+                self.device.write("AEC_FIXEDBEAMSAZIMUTH_VALUES",
+                                  [angle * RAD_PER_DEG,
+                                   ((angle + 180.0) % 360.0) * RAD_PER_DEG])
+                time.sleep(settle)
+                # re-assert: a device that dropped the flag mid-sweep would
+                # silently return free-running readings instead
+                if list(self.device.read("AEC_FIXEDBEAMSONOFF")) != [1]:
+                    self.device.write("AEC_FIXEDBEAMSONOFF", [1])
+                    time.sleep(settle)
+                e1, e2 = [float(v) for v in
+                          self.device.read("AEC_SPENERGY_VALUES")[:2]]
+                steps.append({"beam1_deg": angle,
+                              "beam2_deg": (angle + 180.0) % 360.0,
+                              "e1": e1, "e2": e2})
+                angle += step_deg
+        except Exception as exc:  # noqa: BLE001
+            self.restore()
+            return {"ok": False, "reason": str(exc), "steps": steps}
+
+        self.restore()
+
+        readings = step_deg / 2.0      # each step represents half a step either side
+        peaks = sorted(
+            [{"deg": s["beam1_deg"], "energy": s["e1"]} for s in steps] +
+            [{"deg": s["beam2_deg"], "energy": s["e2"]} for s in steps],
+            key=lambda p: p["energy"], reverse=True)
+        loudest = peaks[0] if peaks else {"deg": 0.0, "energy": 0.0}
+        silent = loudest["energy"] <= 0.0
+        # Both beams are swept, so one physical source shows up twice: once as
+        # beam1 at its bearing and once as beam2 at the opposite step. Counting
+        # the second sighting as a second person would recommend steering both
+        # beams onto the same talker, so the runner-up must be far enough away
+        # to be someone else - a full step away at minimum, which at 30 degrees
+        # of steps means the two sightings of one source (180 apart) collapse.
+        min_gap = max(90.0, 2.0 * readings)
+        second = next((p for p in peaks[1:]
+                       if _angle_gap(p["deg"], loudest["deg"]) >= min_gap
+                       and p["energy"] > 0), None)
+        return {"ok": True, "steps": steps, "step_deg": step_deg,
+                "peak": loudest, "second": second,
+                "silent": silent,
+                "hint": ("未检测到语音：扫描期间需要有人持续说话" if silent else
+                         f"能量峰在 {loudest['deg']:.0f}° (E={loudest['energy']:.0f})")}
+
+
+def _angle_gap(a: float, b: float) -> float:
+    """Shortest angular distance between two bearings, in degrees."""
+    d = abs((a - b) % 360.0)
+    return min(d, 360.0 - d)
 
 
 class BeamRouter:

@@ -256,6 +256,12 @@ def parse_args(argv=None):
     p.add_argument("--beam-recon", action="store_true", help="read-only beam probe then exit")
     p.add_argument("--beam-probe", action="store_true",
                    help="read-only survey of every beam parameter then exit")
+    p.add_argument("--beam-scan", action="store_true",
+                   help="sweep the steered beams to locate where speech is "
+                        "(someone must keep talking during the sweep)")
+    p.add_argument("--beam-scan-step", type=float, default=30.0,
+                   help="scan step in degrees (default 30; the two beams are "
+                        "placed 180 apart, so 6 steps cover the circle)")
     p.add_argument("--beam-fixed", nargs=2, type=float, metavar=("AZ1", "AZ2"),
                    default=None,
                    help="steer the two fixed beams to these azimuths (degrees, "
@@ -346,6 +352,35 @@ def main(argv=None) -> int:
         survey = FixedBeamController(device).probe()
         for name, val in survey.items():
             print(f"[beam] {name} = {val}")
+        return 0
+
+    if args.beam_scan:
+        if device is None:
+            print("[beam] scan requires the USB control plane")
+            return 1
+        from .beam_router import FixedBeamController
+
+        controller = FixedBeamController(device)
+        print(f"[beam] scanning in {args.beam_scan_step:g}° steps - "
+              f"请持续说话让扫描能找到你…")
+        scan = controller.scan(step_deg=args.beam_scan_step)
+        for s in scan.get("steps", []):
+            print(f"  beam1={s['beam1_deg']:5.1f}°  beam2={s['beam2_deg']:5.1f}°  "
+                  f"E1={s['e1']:10.0f}  E2={s['e2']:10.0f}")
+        if not scan.get("ok"):
+            print(f"[beam] scan failed: {scan.get('reason')}")
+            return 1
+        print(f"[beam] {scan['hint']}")
+        if scan.get("second"):
+            s = scan["second"]
+            print(f"[beam] 次峰在 {s['deg']:.0f}° (E={s['energy']:.0f})")
+            print(f"[beam] 可试用: --beam-fixed {scan['peak']['deg']:.0f} "
+                  f"{s['deg']:.0f}")
+        elif not scan["silent"]:
+            print("[beam] 只找到一个峰，未给出第二方位（可能只有一人说话）")
+        # the sweep always restores; re-steering here would be a second,
+        # unreported write, so the caller decides using the printed angles
+        print("[beam] 设备已恢复扫描前状态；如需应用请用上面的 --beam-fixed")
         return 0
 
     beam_controller = None
