@@ -40,6 +40,40 @@ assert not (set(STEER_WRITES) & GUARDED_CMDS), (
 RAD_PER_DEG = math.pi / 180.0
 DEG_PER_RAD = 180.0 / math.pi
 
+# Category numbers seen in this device's AUDIO_MGR_OP_ALL. They are the
+# <category> half of each <category>, <source> pair. Read them as "which
+# stage of the pipeline feeds this output". These are transcribed from what
+# the device reports, not from a documented enumeration - XMOS publishes the
+# pair format but not the category numbers - so TREAT THEM AS AN OBSERVATION,
+# not as a specification:
+#   8  the processed ("Conference") output - the device ships L = (8, 0)
+#   7  the ASR beam path - the device ships R = (7, 3)
+#   1  per-mic signals - the device puts (1, 0), (1, 2), (1, 1), (1, 3) in
+#      the four secondary slots, and source 0..3 is exactly the four mics
+#   4  far-end reference, raw          (from the XVF3800 documentation)
+#   12 far-end reference, with gain/delay (from the XVF3800 documentation)
+# The 4 and 12 values come from published documentation while 1, 7 and 8 come
+# from this unit, which is why the probe reports rather than asserts.
+CAT_CONFERENCE = 8
+CAT_ASR_OUTPUT = 7
+CAT_MIC_RAW = 1
+CAT_FAR_RAW = 4
+CAT_FAR_GAINED = 12
+
+# For the ASR-output category the source is a beam index. The ordering is the
+# one AEC_AZIMUTH_VALUES and AEC_SPENERGY_VALUES both use, and the device
+# ships source 3, which is the auto-select beam in that same ordering - so the
+# reading is corroborated rather than assumed.
+BEAM_SOURCES = {0: "beam1", 1: "beam2", 2: "free-running", 3: "auto-select"}
+
+# Where OP_L and OP_R land in the 6-channel capture stream. The firmware
+# documentation states the two programmable outputs feed the first two
+# channels and the remaining four are fixed per-mic channels.
+SLOT_CHANNEL = {"L": 0, "R": 1}
+
+# The stream is 6 channels regardless of routing: OP_L/OP_R choose what the
+# first two carry, they do not change the channel count.
+
 # everything beam-related, in the order a human reads it. Read-only: the probe
 # never writes, so it is safe on a live device.
 PROBE_PARAMS = [
@@ -250,6 +284,30 @@ def _angle_gap(a: float, b: float) -> float:
     return min(d, 360.0 - d)
 
 
+def pair_name(category: int, source: int) -> str:
+    """Human name for one <category>, <source> pair, best effort.
+
+    Returns a name carrying a "?" when the category was never observed on
+    this unit, so an unverified reading cannot be mistaken for a known one.
+    """
+    if category == CAT_ASR_OUTPUT:
+        return BEAM_SOURCES.get(source, f"beam?{source}")
+    if category == CAT_CONFERENCE:
+        return "conference"
+    if category == CAT_MIC_RAW:
+        return f"mic{source}"
+    if category == CAT_FAR_RAW:
+        return "far-end raw"
+    if category == CAT_FAR_GAINED:
+        return "far-end gained"
+    return f"cat?{category}/src{source}"
+
+
+def describe_pair(category: int, source: int) -> str:
+    """A pair as it would be printed alongside the channel it lands on."""
+    return f"({category},{source})={pair_name(category, source)}"
+
+
 class BeamRouter:
     def __init__(self, device: ReSpeaker):
         self.device = device
@@ -314,3 +372,42 @@ class BeamRouter:
             return True
         except Exception:  # noqa: BLE001
             return False
+
+    # ------------------------------------------------------------------
+    def current_pair(self, slot: str) -> tuple[int, int]:
+        """The <category>, <source> pair the given slot currently outputs."""
+        op_all = self.device.read("AUDIO_MGR_OP_ALL")
+        base = 0 if slot.upper() == "L" else 6
+        if len(op_all) < base + 2:
+            raise ValueError(f"AUDIO_MGR_OP_ALL too short for slot {slot}")
+        return tuple(op_all[base:base + 2])
+
+    def route_slot(self, slot: str, category: int, source: int) -> dict:
+        """Point one output slot at a category/source, with rollback.
+
+        This is the whole of the channel-routing capability: a lot of callers
+        only need "put beam 1 on L and beam 2 on R", and for that the
+        generic apply(), which needs recon() to disambiguate pair order, is
+        more machinery than necessary.
+        """
+        self._original = list(self.device.read("AUDIO_MGR_OP_ALL"))
+        op_all = list(self._original)
+        base = 0 if slot.upper() == "L" else 6
+        if len(op_all) < base + 2:
+            self._original = None
+            return {"ok": False, "reason": "AUDIO_MGR_OP_ALL too short"}
+        op_all[base:base + 2] = [category, source]
+        try:
+            self.device.write("AUDIO_MGR_OP_ALL", op_all)
+            ok = list(self.device.read("AUDIO_MGR_OP_ALL")) == op_all
+        except Exception as exc:  # noqa: BLE001
+            self.restore()
+            return {"ok": False, "reason": str(exc)}
+        if not ok:
+            self.restore()
+            return {"ok": False, "reason": "verify failed, restored"}
+        return {"ok": True, "slot": slot.upper(),
+                "pair": (category, source),
+                "channel": SLOT_CHANNEL.get(slot.upper()),
+                "describe": describe_pair(category, source),
+                "restore_to": list(self._original)}

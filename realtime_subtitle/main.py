@@ -253,6 +253,9 @@ def parse_args(argv=None):
                         "so the model decodes the opening words immediately "
                         "instead of waiting 600ms for a full chunk")
     p.add_argument("--beam-recon", action="store_true", help="read-only beam probe then exit")
+    p.add_argument("--beam-channels", action="store_true",
+                   help="read-only survey of how the two programmable outputs "
+                        "map onto capture channels, then exit")
     p.add_argument("--beam-probe", action="store_true",
                    help="read-only survey of every beam parameter then exit")
     p.add_argument("--beam-scan", action="store_true",
@@ -423,6 +426,34 @@ def main(argv=None) -> int:
             candidate = info["pairs"][2]
             print(f"[beam] applying candidate {candidate} -> slot R")
             print(router.apply(candidate, "R"))
+        return 0
+
+    if args.beam_channels:
+        if device is None:
+            print("[beam] channel survey requires the USB control plane")
+            return 1
+        from .beam_router import (SLOT_CHANNEL, BeamRouter, describe_pair,
+                                  pair_name)
+
+        router = BeamRouter(device)
+        op_all = router.recon()["op_all"]
+        print(f"[beam] AUDIO_MGR_OP_ALL={op_all}")
+        print("[beam] the two programmable outputs and where they land:")
+        for slot in ("L", "R"):
+            cat, src = router.current_pair(slot)
+            print(f"[beam]   OP_{slot} = {describe_pair(cat, src)}"
+                  f"  -> capture ch{SLOT_CHANNEL[slot]}")
+        print("[beam] the remaining slots of the routing table:")
+        for i, pair in enumerate(router.recon()["pairs"]):
+            slot = "L" if i < 3 else "R"
+            note = ("first source" if i % 3 == 0
+                    else f"packed source {i % 3}")
+            print(f"[beam]   {slot}/{note}: {describe_pair(*pair)}")
+        print("[beam] capture ch2-5 are fixed per-mic channels and are not "
+              "selected by OP_L/OP_R; to confirm that on this unit, use "
+              "tools/p2_channel_probe.py (needs a played stimulus)")
+        print("[beam] category numbers are observations from this device, not "
+              "a documented enumeration - unknown ones print as cat?N")
         return 0
 
     # ---- audio input ---------------------------------------------------
