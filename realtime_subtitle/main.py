@@ -905,6 +905,25 @@ def main(argv=None) -> int:
             device=input_device, channels=in_channels,
             samplerate=SAMPLE_RATE, dtype="float32", callback=audio_callback,
         ):
+            # A dual-lane run changes the device configuration, so it must put
+            # it back on every way out - not just Ctrl+C. `timeout` (and any
+            # supervisor) sends SIGTERM, which as a plain exception would skip
+            # the finally block entirely and leave the unit routed to two beams
+            # that nobody chose. Verified the hard way: a killed run left
+            # OP_ALL at [7,0,...,7,1,...] with SONOFF=1 and bearing [180,0].
+            # Converting the signal into KeyboardInterrupt routes it through the
+            # same cleanup path.
+            import signal
+
+            def _on_term(_signum, _frame):
+                raise KeyboardInterrupt
+
+            for _sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    signal.signal(_sig, _on_term)
+                except (ValueError, OSError):  # not the main thread / unavail.
+                    pass
+
             print("[main] running - Ctrl+C to stop")
             while True:
                 now = time.time()
