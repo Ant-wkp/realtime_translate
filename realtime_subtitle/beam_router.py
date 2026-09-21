@@ -313,6 +313,19 @@ class BeamRouter:
         self.device = device
         self._original: list[int] | None = None
 
+    def _remember(self) -> None:
+        """Snapshot the routing the first time, and never again.
+
+        Recording it on every write looks harmless but is not: setting two
+        slots in a row (which is exactly what the dual-lane setup does) would
+        leave `_original` holding the state after the *first* change, so
+        restore() would put back a half-applied route and quietly leave the
+        other slot pointing at the experiment. Only the first snapshot is the
+        state the operator actually had.
+        """
+        if self._original is None:
+            self._original = list(self.device.read("AUDIO_MGR_OP_ALL"))
+
     # ------------------------------------------------------------------
     def recon(self) -> dict:
         """Read-only probe of the current output routing."""
@@ -345,7 +358,7 @@ class BeamRouter:
             return {"ok": False, "reason": info.get("reason"), "changed": False}
 
         op_all = self.device.read("AUDIO_MGR_OP_ALL")
-        self._original = list(op_all)
+        self._remember()
 
         if slot.upper() == "L":
             op_all[0:2] = list(candidate_pair)
@@ -364,7 +377,7 @@ class BeamRouter:
         return {"ok": True, "changed": True, "slot": slot, "pair": candidate_pair}
 
     def restore(self) -> bool:
-        """Roll back to the route saved before the last apply()."""
+        """Roll back to the route saved before the first apply()."""
         if self._original is None:
             return False
         try:
@@ -390,11 +403,14 @@ class BeamRouter:
         generic apply(), which needs recon() to disambiguate pair order, is
         more machinery than necessary.
         """
-        self._original = list(self.device.read("AUDIO_MGR_OP_ALL"))
-        op_all = list(self._original)
+        # snapshot the pre-experiment route, then start from the *current*
+        # route, not from that snapshot: setting two slots in a row must
+        # accumulate, and starting from the snapshot each time would silently
+        # discard the previous slot's change.
+        self._remember()
+        op_all = list(self.device.read("AUDIO_MGR_OP_ALL"))
         base = 0 if slot.upper() == "L" else 6
         if len(op_all) < base + 2:
-            self._original = None
             return {"ok": False, "reason": "AUDIO_MGR_OP_ALL too short"}
         op_all[base:base + 2] = [category, source]
         try:
