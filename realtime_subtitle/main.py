@@ -21,6 +21,7 @@ import queue
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -60,12 +61,77 @@ SHORT_EXEMPT_MAX_PROB = 0.5 # peak probability required for exemption
 RATIO_THRESHOLD = 0.35      # segment speech-frame ratio floor
 TRIM_TAIL_ENERGY = 1e-4     # RMS below which tail frames are trimmed
 
+# Default per-beam energy floor for the `energy` gate, from what the array
+# actually reports: a quiet room reads 0..42916 and clapping reaches
+# 2.4M..4.3M, so this sits five times above the loudest noise floor and an
+# order of magnitude below speech. It is a starting point for calibration
+# against real voices, not a tuned value.
+BEAM_ENERGY_THRESHOLD = 200000.0
+
+
+@dataclass
+class Lane:
+    """One independent caption channel: its own audio, VAD and segment state.
+
+    Everything that must not be shared lives here, and the list is not
+    arbitrary. SileroVad keeps RNN state inside the model object, so two lanes
+    sharing one instance would corrupt each other's probabilities exactly the
+    way two streams sharing one ASR cache dict would. The confirm-gate
+    counters are the same kind of state: shared, a hardware tick in one lane
+    would advance the other lane's rejection count. Each lane also gets its
+    own SpeakerLocator so a reset at segment open cannot clear the other
+    lane's tally.
+    """
+
+    index: int
+    channel: int                     # capture channel index
+    beam_index: int = 0              # 0 = beam1, 1 = beam2
+    azimuth: float = 0.0
+    label: str = ""
+    tag: str = ""                    # log prefix; empty in single-lane mode
+    energy_threshold: float = BEAM_ENERGY_THRESHOLD
+    queue: queue.Queue = field(default_factory=queue.Queue)
+    # most recent control-plane readings (shared source, per-tick snapshot)
+    hw_vad: int = 0
+    energy: list[float] = field(default_factory=list)
+    # gate state, per lane
+    confirm_pending: bool = False
+    confirm_sw_reject: int = 0
+    # `energy` mode needs a hold: SPENERGY reads exactly 0 the instant nobody
+    # is talking, so a gate on the instantaneous value would drop the lane
+    # during every inter-word pause and chop sentences. Hold the last active
+    # reading for as long as the segmenter's own silence hold, which is the
+    # same question ("is this utterance still going?") asked of the same
+    # signal, so the two agree by construction rather than by coincidence.
+    energy_active_at: float = 0.0
+    segmenter: object = None
+    vad: object = None
+    locator: object = None
+
+    def energy_active(self, now: float, hold: float) -> bool:
+        """Whether this lane's beam has heard anything recently."""
+        if not self.energy:
+            # no control plane (audio-only run): never let the gate block
+            return True
+        idx = self.beam_index if self.beam_index < len(self.energy) else 0
+        if self.energy[idx] > self.energy_threshold:
+            self.energy_active_at = now
+            return True
+        return (now - self.energy_active_at) < hold
+
 
 class VadDoaReader(threading.Thread):
-    """Poll DOA_VALUE (angle + speech activity) off the control plane.
+    """Poll DOA_VALUE (angle + speech activity) and per-beam energy.
 
     Isolates USB control transfers (which can block 1 s+ on RETRY storms)
     from the strictly-paced main loop.
+
+    AEC_SPENERGY_VALUES is read alongside DOA_VALUE because it is the only
+    per-beam signal the device exposes: DOA_VALUE[1] is a single device-wide
+    speech flag and cannot say which beam heard anything, so it cannot gate
+    two lanes independently. The beam energies are also the one reading that
+    stays valid over long distances, being a per-beam scalar rather than a set
+    of relative delays.
     """
 
     def __init__(self, device, interval: float = 0.1):
@@ -81,10 +147,16 @@ class VadDoaReader(threading.Thread):
                 vals = self.device.read("DOA_VALUE")
                 azimuth = vals[0] if vals else None
                 hw_vad = int(vals[1]) if len(vals) > 1 else 0
+                try:
+                    energy = [float(v) for v in
+                              self.device.read("AEC_SPENERGY_VALUES")]
+                except Exception:  # noqa: BLE001 - energy is an extra, not a
+                    energy = []     # reason to lose the VAD reading
                 self.vad_queue.put({"hw_vad": hw_vad, "doa": azimuth,
-                                    "error": False})
+                                    "energy": energy, "error": False})
             except Exception:  # noqa: BLE001
-                self.vad_queue.put({"hw_vad": 0, "doa": None, "error": True})
+                self.vad_queue.put({"hw_vad": 0, "doa": None, "energy": [],
+                                    "error": True})
             time.sleep(self.interval)
 
     def stop(self) -> None:
@@ -167,9 +239,11 @@ class FinalDecodeThread(threading.Thread):
         self.job_queue: queue.Queue = queue.Queue()
         self._stop = threading.Event()
 
-    def submit(self, task_id: str, audio, doa: str = "", partial_hint: str = "") -> None:
+    def submit(self, task_id: str, audio, doa: str = "", partial_hint: str = "",
+               lane: int = 0) -> None:
         self.job_queue.put({"task_id": task_id, "audio": audio,
-                            "doa": doa, "partial_hint": partial_hint})
+                            "doa": doa, "partial_hint": partial_hint,
+                            "lane": lane})
 
     def run(self) -> None:
         while not self._stop.is_set():
@@ -210,6 +284,7 @@ class FinalDecodeThread(threading.Thread):
                     "mode": mode,
                     "task_id": job["task_id"],
                     "doa": job["doa"],
+                    "lane": job.get("lane", 0),
                     "final_replaces_partial": True,
                     "partial_hint": job["partial_hint"],
                 },
@@ -236,7 +311,16 @@ def parse_args(argv=None):
     p.add_argument("--asr-chunk-size", choices=["480", "600"], default="480",
                    help="streaming decode stride: 480ms (default, lower latency) "
                         "or 600ms (upstream default, longer lookahead)")
-    p.add_argument("--vad-gate", choices=["hw", "and", "confirm"], default="and")
+    p.add_argument("--vad-gate", choices=["hw", "and", "confirm", "energy"],
+                   default="and",
+                   help="energy adds a per-beam SPENERGY floor; on multiple "
+                        "lanes it is the only gate that can tell the lanes "
+                        "apart, since the hardware speech flag is device-wide")
+    p.add_argument("--beam-energy-threshold", type=float,
+                   default=BEAM_ENERGY_THRESHOLD,
+                   help=f"per-beam SPENERGY floor for --vad-gate energy "
+                        f"(default {BEAM_ENERGY_THRESHOLD:.0f}; a quiet room "
+                        f"reads up to ~43000 and clapping reaches ~2.4M)")
     p.add_argument("--audio-source", default="conference",
                    choices=["conference", "asr", "mic0", "mic1", "mic2", "mic3"])
     p.add_argument("--ch", type=int, default=None, help="explicit channel index (0-based)")
@@ -464,6 +548,7 @@ def main(argv=None) -> int:
     print(f"[audio] device {input_device}, {in_channels} ch, extract ch{ch_index + 1}: {ch_desc}")
 
     from .speaker_locator import SpeakerLocator
+    from .sw_vad import SileroVad
 
     locator = SpeakerLocator()
 
@@ -490,8 +575,6 @@ def main(argv=None) -> int:
 
     translator = NllbCTranslate2Provider()
     print(f"[NLLB] model: {translator.model_path}")
-
-    from .sw_vad import SileroVad
 
     sw_vad = SileroVad(threshold=SW_FRAME_THRESHOLD)
     print("[VAD] Silero software VAD ready")
@@ -526,7 +609,7 @@ def main(argv=None) -> int:
     def on_asr_result(result):
         result_queue.put(result)
 
-    def on_partial(stream_id, text):
+    def on_partial(stream_id, text, lane: int = 0):
         # first-character latency: first non-empty partial after the segment
         # opened. This is the number the pre-roll seed is meant to shrink -
         # the [耗时] line measures "after speech ended", which is a different
@@ -546,7 +629,10 @@ def main(argv=None) -> int:
                         print(f"[首字] {stream_id[:8]} 张嘴→首字: {dt:.2f}s "
                               f"(均值 {avg:.2f}s / {n} 句, seed {seed:.2f}s)")
         server.broadcast({
-            "type": "partial", "id": stream_id, "ts": time.time(), "text": text,
+            "type": "partial", "id": stream_id, "ts": time.time(),
+            "text": text,
+            "lane": lane,
+            "lane_label": (lanes[lane].label if lane < len(lanes) else ""),
         })
 
     from .transcriber import TranscriberWorker
@@ -561,7 +647,7 @@ def main(argv=None) -> int:
         audio = (trim_tail(req.audio, TRIM_TAIL_ENERGY)
                  if req.audio is not None and req.audio.size else req.audio)
         final_decode.submit(req.task_id, audio, doa=req.doa,
-                            partial_hint=req.partial_hint)
+                            partial_hint=req.partial_hint, lane=req.lane)
 
     transcriber = TranscriberWorker(provider, on_result=on_asr_result,
                                     on_partial=on_partial,
@@ -578,53 +664,92 @@ def main(argv=None) -> int:
     # flush filters) lives in Segmenter so that it can run once per lane and
     # so this loop stays a transaction: drain, feed, act on the returned
     # Actions. See segmenter.py.
-    audio_queue: queue.Queue = queue.Queue()
+    #
+    # A single lane is not a special case: it is a one-element lane list, so
+    # the code below has one shape instead of two. That is what makes the
+    # "single-lane behaviour is unchanged" claim testable - there is no second
+    # path that could drift from the first.
+    seg_cfg = SegmentCfg(min_seconds=args.min_seconds,
+                         max_seconds=args.max_seconds,
+                         silence_hold=args.silence_hold,
+                         pre_roll=args.pre_roll,
+                         short_exempt_seconds=SHORT_EXEMPT_SECONDS,
+                         short_exempt_max_prob=SHORT_EXEMPT_MAX_PROB,
+                         ratio_threshold=RATIO_THRESHOLD,
+                         trim_tail_energy=TRIM_TAIL_ENERGY,
+                         debug=args.debug_gate)
+
+    # In single-lane mode the segmenter keeps the caller's original sw_vad
+    # object, so nothing about it changes; extra lanes get their own.
+    lanes: list[Lane] = []
+    lane0 = Lane(index=0, channel=ch_index, beam_index=0,
+                 azimuth=0.0, label="", tag="",
+                 energy_threshold=args.beam_energy_threshold,
+                 segmenter=Segmenter(seg_cfg, sw_vad, lane=0), vad=sw_vad,
+                 locator=locator)
+    lanes.append(lane0)
+    for ln in lanes[1:]:                     # no extra lanes yet (P4 adds them)
+        ln.vad = SileroVad(threshold=SW_FRAME_THRESHOLD)
+        ln.segmenter = Segmenter(seg_cfg, ln.vad, lane=ln.index,
+                                 azimuth=ln.azimuth, label=ln.label,
+                                 tag=ln.tag)
+        ln.locator = SpeakerLocator()
 
     def audio_callback(indata, frames, time_info, status):
+        """Fan one capture block out to every lane's own queue.
+
+        One stream, one block, N lanes: opening a stream per lane would put
+        two PortAudio clients on the same USB device, which crashes it, and
+        would also give the lanes independent clocks. Slicing here keeps them
+        on the same clock by construction.
+        """
         if status:
             pass  # overflow flags are tolerated; queue drops are the backpressure
-        audio_queue.put(indata[:, ch_index].copy())
+        for ln in lanes:
+            ln.queue.put(indata[:, ln.channel].copy())
 
-    segmenter = Segmenter(
-        SegmentCfg(min_seconds=args.min_seconds, max_seconds=args.max_seconds,
-                   silence_hold=args.silence_hold, pre_roll=args.pre_roll,
-                   short_exempt_seconds=SHORT_EXEMPT_SECONDS,
-                   short_exempt_max_prob=SHORT_EXEMPT_MAX_PROB,
-                   ratio_threshold=RATIO_THRESHOLD,
-                   trim_tail_energy=TRIM_TAIL_ENERGY,
-                   debug=args.debug_gate),
-        sw_vad, lane=0)
+    def gate_verdict(ln: Lane, sw_prob: float) -> bool:
+        """Gate verdict for one lane.
 
-    doa_last = None
-    # confirm-mode state: hardware opens the door, software decides entry/exit
-    confirm_pending = False
-    confirm_sw_reject = 0
-
-    def gate_verdict(sw_prob: float, hw_vad: int) -> bool:
-        nonlocal confirm_pending, confirm_sw_reject
+        `energy` is the per-lane mode: the beam that faces a talker hears more
+        than the one facing away, which is the only per-lane signal available,
+        so the verdict is that beam's energy AND the software VAD - the same
+        and-semantics the project already uses, with a lane-specific first
+        operand instead of the device-wide hardware flag.
+        """
         if args.vad_gate == "hw":
-            return hw_vad == 1
+            return ln.hw_vad == 1
         if args.vad_gate == "and":
-            return hw_vad == 1 and sw_prob >= SW_FRAME_THRESHOLD
+            return ln.hw_vad == 1 and sw_prob >= SW_FRAME_THRESHOLD
+        if args.vad_gate == "energy":
+            return (ln.energy_active(time.time(), args.silence_hold)
+                    and sw_prob >= SW_FRAME_THRESHOLD)
         # confirm: hw opens the door, software decides entry/exit
-        if confirm_pending:
+        if ln.confirm_pending:
             if sw_prob >= SW_FRAME_THRESHOLD:
-                confirm_sw_reject = 0
+                ln.confirm_sw_reject = 0
                 return True
-            confirm_sw_reject += 1
-            if confirm_sw_reject >= 5:
-                confirm_pending = False
-                confirm_sw_reject = 0
+            ln.confirm_sw_reject += 1
+            if ln.confirm_sw_reject >= 5:
+                ln.confirm_pending = False
+                ln.confirm_sw_reject = 0
                 return False
             return True
-        if hw_vad == 1:
-            confirm_pending = True
-            confirm_sw_reject = 0
+        if ln.hw_vad == 1:
+            ln.confirm_pending = True
+            ln.confirm_sw_reject = 0
             return sw_prob >= SW_FRAME_THRESHOLD
         return False
 
-    def apply_actions(actions):
-        """Translate Segmenter Actions into calls on the rest of the system."""
+    def apply_actions(ln: Lane, actions):
+        """Translate Segmenter Actions into calls on the rest of the system.
+
+        Takes the lane rather than closing over a single segmenter, because
+        every side effect here is per lane: the DOA tally to reset, the stream
+        to open, the anchors to record. The broadcast carries the lane too so
+        the frontend can badge the card.
+        """
+        seg = ln.segmenter
         for act in actions:
             # diagnostics first, in the order the inline loop printed them
             if act.flush_line:
@@ -635,7 +760,7 @@ def main(argv=None) -> int:
                 seg_open_at[act.seg_id] = time.monotonic()
                 # start a fresh DOA tally: the reported direction must
                 # describe this utterance; flush reads it back via locator.mode()
-                locator.reset()
+                ln.locator.reset()
                 seg_seed_secs[act.seg_id] = act.seed_secs
                 if args.streaming and provider.supports_streaming:
                     transcriber.stream_start(act.seg_id)
@@ -644,7 +769,7 @@ def main(argv=None) -> int:
                         act.audio if act.audio is not None and act.audio.size
                         else np.zeros(0, np.float32),
                         act.seg_id)
-                    segmenter.mark_stream_open()
+                    seg.mark_stream_open()
                 print(f"[seg] open {act.seg_id} (seed {act.seed_secs:.2f}s)")
             elif act.kind == "feed":
                 transcriber.stream_feed(act.seg_id, act.audio, act.seg_id)
@@ -653,7 +778,8 @@ def main(argv=None) -> int:
                     transcriber.stream_abort(act.seg_id)
                 if act.seg_id:
                     server.broadcast({"type": "discard", "id": act.seg_id,
-                                      "ts": time.time()})
+                                      "ts": time.time(), "lane": ln.index,
+                                      "lane_label": ln.label})
                     seg_open_at.pop(act.seg_id, None)
                     seg_seed_secs.pop(act.seg_id, None)
                     first_char_logged.discard(act.seg_id)
@@ -661,10 +787,11 @@ def main(argv=None) -> int:
                 seg_id = act.seg_id
                 if act.stream_opened:
                     transcriber.stream_finish(seg_id, task_id=seg_id,
-                                              doa=locator.mode())
+                                              doa=ln.locator.mode(),
+                                              lane=ln.index)
                 else:
                     transcriber.submit(act.audio, task_id=seg_id,
-                                       doa=locator.mode())
+                                       doa=ln.locator.mode(), lane=ln.index)
                 # Timing anchors are only meaningful for segments that
                 # actually reach ASR. A rejected segment already aborted its
                 # stream and told the frontend to drop the card, so recording
@@ -690,16 +817,9 @@ def main(argv=None) -> int:
             while True:
                 now = time.time()
 
-                # 2) drain audio
-                chunks = []
-                while True:
-                    try:
-                        chunks.append(audio_queue.get_nowait())
-                    except queue.Empty:
-                        break
-
-                # 3) drain hw VAD / DOA
+                # 3) drain hw VAD / DOA / per-beam energy
                 hw_vad = 0
+                energy: list[float] = []
                 while True:
                     try:
                         snap = vad_reader.vad_queue.get_nowait() if vad_reader else None
@@ -708,27 +828,51 @@ def main(argv=None) -> int:
                     if snap is None:
                         continue
                     hw_vad = snap["hw_vad"]
+                    if snap.get("energy"):
+                        energy = snap["energy"]
                     if snap["doa"] is not None:
                         doa_last = snap["doa"]
-                        if segmenter.active:
+                        if lanes[0].segmenter.active:
                             locator.observe(doa_last)
 
-                # 4) segmentation: the segmenter runs the software VAD, gate
-                # verdict and every state transition from a single reading,
-                # returning the Actions this tick owes the rest of the system.
-                # The gate line reports the state *before* those transitions,
-                # as the inline loop did.
-                speaking = segmenter.active
-                actions = segmenter.feed(
-                    chunks, lambda p: gate_verdict(p, hw_vad), hw_vad, now)
-                sw_prob = segmenter.last_prob
-                gate = segmenter.last_gate
+                # The control plane is device-wide, so its reading is fanned
+                # out to every lane; only the interpretation differs, and that
+                # lives in gate_verdict.
+                for ln in lanes:
+                    ln.hw_vad = hw_vad
+                    ln.energy = energy
 
-                if args.debug_gate and (hw_vad or sw_prob >= 0.05 or speaking):
-                    print(f"[gate] hw={hw_vad} sw={sw_prob:.3f} gate={gate} "
-                          f"state={'SPK' if speaking else 'IDLE'} doa={doa_last}")
+                # 4) one segmenter per lane, each returning the Actions that
+                # lane owes the rest of the system this tick. The loop stays
+                # single-threaded on purpose: two segmenters driven from two
+                # threads would race on the shared telemetry and lose the
+                # 100 ms tick semantics that the timing numbers depend on.
+                for ln in lanes:
+                    seg = ln.segmenter
+                    chunks = []
+                    while True:
+                        try:
+                            chunks.append(ln.queue.get_nowait())
+                        except queue.Empty:
+                            break
+                    speaking = seg.active
+                    actions = seg.feed(chunks, lambda p, l=ln: gate_verdict(l, p),
+                                       ln.hw_vad, now)
+                    sw_prob = seg.last_prob
+                    gate = seg.last_gate
 
-                apply_actions(actions)
+                    if args.debug_gate and (ln.hw_vad or sw_prob >= 0.05 or speaking):
+                        print(f"{ln.tag}[gate] hw={ln.hw_vad} sw={sw_prob:.3f} "
+                              f"gate={gate} "
+                              f"state={'SPK' if speaking else 'IDLE'} "
+                              f"doa={doa_last}")
+
+                    apply_actions(ln, actions)
+
+                # the heartbeat and the idle-path debug line describe lane 0 in
+                # single-lane mode; with more lanes each one contributes
+                speaking = lanes[0].segmenter.active
+                sw_prob = lanes[0].segmenter.last_prob
 
                 # 5) frontend commands
                 while True:
@@ -783,6 +927,8 @@ def main(argv=None) -> int:
                     # the card label and the translation direction are both
                     # derived from the recognized text instead.
                     lang = detect_language(result.text)
+                    lane_idx = int(result.meta.get("lane", 0))
+                    lane_obj = lanes[lane_idx] if lane_idx < len(lanes) else lanes[0]
                     server.broadcast({
                         "type": "final" if is_final else "source",
                         "id": task_id,
@@ -790,16 +936,28 @@ def main(argv=None) -> int:
                         "doa": result.meta.get("doa", ""),
                         "text": result.text,
                         "lang": lang,
+                        "lane": lane_idx,
+                        "lane_label": lane_obj.label,
                     })
                     translation.submit(task_id, result.text, lang)
 
-                # heartbeat broadcast
+                # heartbeat broadcast. The per-lane form is additive: the
+                # top-level hw_vad/sw_prob/segment_state stay exactly as they
+                # were so a single-lane frontend sees no change, and `lanes`
+                # only carries data once there is more than one.
                 server.broadcast({
                     "type": "vad.state",
                     "hw_vad": hw_vad,
                     "sw_prob": round(sw_prob, 3),
                     "gate_mode": args.vad_gate,
                     "segment_state": "SPEAKING" if speaking else "IDLE",
+                    "lanes": [
+                        {"lane": ln.index, "label": ln.label,
+                         "active": ln.segmenter.active,
+                         "energy": int(max(ln.energy[ln.beam_index],
+                                           ln.energy[0]) if ln.energy else 0)}
+                        for ln in lanes
+                    ] if len(lanes) > 1 else [],
                 })
 
                 elapsed = time.time() - now

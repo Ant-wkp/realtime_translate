@@ -24,6 +24,7 @@ class Task:
     doa: str = ""
     stream_id: str | None = None
     kind: str = "transcribe"  # transcribe | finish | abort
+    lane: int = 0
     meta: dict = field(default_factory=dict)
 
 
@@ -40,6 +41,7 @@ class FinalRequest:
     audio: object
     partial_hint: str = ""
     doa: str = ""
+    lane: int = 0
 
 
 class TranscriberWorker(threading.Thread):
@@ -55,27 +57,31 @@ class TranscriberWorker(threading.Thread):
 
     # -- called from the main loop (cheap) -----------------------------
     def submit(self, audio, task_id: str, doa: str = "", stream_id: str | None = None,
-               meta: dict | None = None) -> None:
+               lane: int = 0, meta: dict | None = None) -> None:
         self._task_queue.put(
             Task(audio=audio, task_id=task_id, doa=doa, stream_id=stream_id,
-                 kind="transcribe", meta=meta or {})
+                 kind="transcribe", lane=lane, meta=meta or {})
         )
 
-    def stream_start(self, stream_id: str) -> None:
+    def stream_start(self, stream_id: str, lane: int = 0) -> None:
         """Open a streaming utterance session on the worker thread."""
         self._task_queue.put(
-            Task(audio=None, task_id=stream_id, kind="start", stream_id=stream_id)
+            Task(audio=None, task_id=stream_id, kind="start",
+                 stream_id=stream_id, lane=lane)
         )
 
-    def stream_feed(self, stream_id: str, audio, task_id: str) -> None:
+    def stream_feed(self, stream_id: str, audio, task_id: str,
+                    lane: int = 0) -> None:
         self._task_queue.put(
-            Task(audio=audio, task_id=task_id, kind="feed", stream_id=stream_id)
+            Task(audio=audio, task_id=task_id, kind="feed",
+                 stream_id=stream_id, lane=lane)
         )
 
-    def stream_finish(self, stream_id: str, task_id: str, doa: str = "") -> None:
+    def stream_finish(self, stream_id: str, task_id: str, doa: str = "",
+                      lane: int = 0) -> None:
         self._task_queue.put(
             Task(audio=None, task_id=task_id, doa=doa, kind="finish",
-                 stream_id=stream_id)
+                 stream_id=stream_id, lane=lane)
         )
 
     def stream_abort(self, stream_id: str) -> None:
@@ -107,7 +113,7 @@ class TranscriberWorker(threading.Thread):
             if task.kind == "feed":
                 partial = self.provider.feed(task.stream_id, task.audio)
                 if partial and self.on_partial:
-                    self.on_partial(task.stream_id, partial)
+                    self.on_partial(task.stream_id, partial, task.lane)
                 return
             if task.kind == "finish":
                 # online tail only: broadcast the last partial immediately,
@@ -116,7 +122,7 @@ class TranscriberWorker(threading.Thread):
                 if hasattr(self.provider, "finish_online"):
                     partial, audio = self.provider.finish_online(task.stream_id)
                     if partial and self.on_partial:
-                        self.on_partial(task.stream_id, partial)
+                        self.on_partial(task.stream_id, partial, task.lane)
                     if self.on_final_request is not None:
                         self.on_final_request(FinalRequest(
                             task_id=task.task_id,
@@ -124,6 +130,7 @@ class TranscriberWorker(threading.Thread):
                             audio=audio,
                             partial_hint=partial,
                             doa=task.doa,
+                            lane=task.lane,
                         ))
                     return
                 result = self.provider.finish(task.stream_id)
@@ -139,6 +146,7 @@ class TranscriberWorker(threading.Thread):
         result.stream_id = task.stream_id
         result.meta["task_id"] = task.task_id
         result.meta["doa"] = task.doa
+        result.meta["lane"] = task.lane
         result.meta.update(task.meta)
         if self.on_result:
             self.on_result(result)
