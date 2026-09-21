@@ -81,6 +81,143 @@ def rms(a: np.ndarray) -> np.ndarray:
     return np.sqrt(np.mean(a.astype(np.float64) ** 2, axis=0))
 
 
+# ---------------------------------------------------------------------------
+# time-difference-of-arrival analysis
+#
+# Amplitude turned out to be the wrong instrument. In a far field every mic
+# hears a source at nearly the same level - at 1 m the four mics differ by
+# under a millimetre of path length - so "which channel is loudest" mostly
+# ranks the room. What does not blur with distance is *when* each mic hears the
+# source: 47 mm of array radius means up to 275 us of spread, which survives
+# perfectly at any distance.
+# ---------------------------------------------------------------------------
+SOUND_C_PER_US = 343.0 / 1e6      # metres travelled per microsecond
+
+
+def onsets(a: np.ndarray, threshold: float = 0.25,
+           refract: int = 400) -> list[int]:
+    """Sample indices where a transient starts, from the broadband envelope."""
+    env = np.sqrt(np.mean(a.astype(np.float64) ** 2, axis=1))
+    env = np.convolve(env, np.ones(16) / 16, mode="same")
+    thr = env.max() * threshold
+    out: list[int] = []
+    i = 0
+    while i < len(env):
+        if env[i] > thr:
+            j = i
+            while j < len(env) and env[j] > thr:
+                j += 1
+            out.append(i + int(np.argmax(env[i:j])))
+            i = j + refract
+        else:
+            i += 1
+    return out
+
+
+def _lag(ref: np.ndarray, sig: np.ndarray, max_lag: int = 40) -> float:
+    """Sub-sample lag of sig behind ref, by cross-correlation + parabola fit."""
+    n = min(len(ref), len(sig))
+    r = ref[:n] - ref[:n].mean()
+    s = sig[:n] - sig[:n].mean()
+
+    def cc(lag: int) -> float:
+        if lag < 0:
+            return float(np.dot(r[-lag:], s[:n + lag]))
+        if lag > 0:
+            return float(np.dot(r[:n - lag], s[lag:]))
+        return float(np.dot(r, s))
+
+    best = max(range(-max_lag, max_lag + 1), key=cc)
+    if -max_lag < best < max_lag:
+        y0, y1, y2 = cc(best - 1), cc(best), cc(best + 1)
+        den = y0 - 2 * y1 + y2
+        if abs(den) > 1e-12:
+            best += 0.5 * (y0 - y2) / den
+    return best / SAMPLE_RATE * 1e6
+
+
+def channel_delays(x: np.ndarray, ref_slot: int = 0) -> tuple[np.ndarray, int]:
+    """Mean delay of each raw channel relative to `ref_slot`, in microseconds.
+
+    The reference is fixed across every transient on purpose. Measuring each
+    event against its own loudest channel gives every event a different origin,
+    and averaging those differences is meaningless - it was the first thing
+    this analysis got wrong.
+    """
+    events = onsets(x)
+    rows = []
+    for s in events:
+        lo, hi = s - 32, s + 128
+        if lo < 0 or hi > x.shape[0]:
+            continue
+        seg = x[lo:hi][:, RAW_CHANNELS].astype(np.float64)
+        if np.max(np.abs(seg)) < 5e-3:      # too quiet to time
+            continue
+        rows.append([_lag(seg[:, ref_slot], seg[:, c]) for c in range(4)])
+    if not rows:
+        return np.zeros(4), 0
+    return np.mean(rows, axis=0), len(rows)
+
+
+def mic_angles_rad() -> np.ndarray:
+    return np.array([MIC_BEARINGS[i] for i in sorted(MIC_BEARINGS)]) \
+        * np.pi / 180.0
+
+
+def fit_bearing(delays: np.ndarray, angles: np.ndarray,
+                step: float = 0.5) -> tuple[float, float]:
+    """Source bearing and residual for one delay vector under `angles`.
+
+    Model: a plane wave from bearing theta reaches mic i at
+    t_i = -(R/c) cos(theta - beta_i), so the delay relative to mic 0 depends
+    only on the differences of those cosines.
+    """
+    radius = 0.0333
+    best = (0.0, float("inf"))
+    for deg in np.arange(0.0, 360.0, step):
+        th = deg * np.pi / 180.0
+        pred = -(radius / SOUND_C_PER_US) * (
+            np.cos(th - angles) - np.cos(th - angles[0]))
+        err = float(np.sum((pred - delays) ** 2))
+        if err < best[1]:
+            best = (deg, err)
+    return best
+
+
+def rank_permutations(delays: np.ndarray) -> list[tuple[float, tuple]]:
+    """Every channel-to-microphone assignment, ordered by fit residual.
+
+    A square array is symmetric under rotation, so the fit cannot tell one
+    corner from another: cyclic shifts of an assignment are indistinguishable
+    from rotating the assumed array, and the fitted bearing absorbs them. What
+    it *can* tell apart is ordering - whether consecutive channels are
+    neighbouring mics. A good fit therefore arrives as a tie-set of the eight
+    order-preserving assignments, not as a single winner.
+    """
+    import itertools
+
+    angles = mic_angles_rad()
+    out = []
+    for perm in itertools.permutations(range(4)):
+        total = 0.0
+        for d in delays:
+            total += fit_bearing(d, angles[list(perm)])[1]
+        out.append((float(np.sqrt(total / (len(delays) * 4))), perm))
+    return sorted(out, key=lambda t: t[0])
+
+
+def ring_order_perms() -> set[tuple]:
+    """The assignments where consecutive channels are neighbouring mics."""
+    import itertools
+
+    keep = set()
+    for p in itertools.permutations(range(4)):
+        diffs = {(p[(i + 1) % 4] - p[i]) % 4 for i in range(4)}
+        if diffs in ({1}, {3}):
+            keep.add(p)
+    return keep
+
+
 def peak_level(a: np.ndarray, window: int = METRIC_WINDOW) -> np.ndarray:
     """Per-channel maximum of short-window RMS over the capture.
 
@@ -190,6 +327,64 @@ def read_doa(device) -> str:
     return "beam1/beam2/free/auto = " + " ".join(parts)
 
 
+def tdoa_report(steps: list[np.ndarray]) -> int:
+    """Decide the channel order from arrival times, not levels."""
+    print("=" * 72)
+    print("TDOA 分析（用到达时差，不用电平）")
+    print("=" * 72)
+    delays, counts = [], []
+    for i, x in enumerate(steps):
+        d, n = channel_delays(x)
+        delays.append(d)
+        counts.append(n)
+        print(f"位置{i+1}: {n:2d} 个事件  "
+              + " ".join(f"ch{RAW_CHANNELS[c]}={d[c]:+7.1f}"
+                          for c in range(4)) + "  µs")
+    delays = np.array(delays)
+    total_events = sum(counts)
+    if total_events < 8:
+        print(f"\n尚不能结论: 只找到 {total_events} 个可用于定时的事件；"
+              f"请重跑并持续拍手/敲击，或靠近阵列一些。")
+        return 1
+
+    ranked = rank_permutations(delays)
+    best = ranked[0][0]
+    tie = [p for err, p in ranked if err <= best * 1.10 + 1.0]
+    ring = ring_order_perms()
+    print(f"\n最佳拟合 RMS = {best:.1f} µs（阵列理论上限 275 µs）")
+    print(f"并列最优的排列有 {len(tie)} 种（方形阵列旋转对称，循环移位不可区分）")
+
+    ident = (0, 1, 2, 3)
+    ident_err = next(err for err, p in ranked if p == ident)
+    scrambles = [(err, p) for err, p in ranked if p not in ring]
+    print(f"\n  ch2..ch5 = mic0..mic3（恒等）      RMS = {ident_err:5.1f} µs")
+    if scrambles:
+        print(f"  最优的**乱序**排列                RMS = {scrambles[0][0]:5.1f} µs")
+
+    # The decision that actually matters: are consecutive channels adjacent
+    # mics? Rotation is unobservable here, so that - not which corner is
+    # "first" - is the claim worth testing.
+    if ident in tie:
+        print("\n结论: 恒等排列在可接受范围内 → **即使不假设任何旋转**，")
+        print("      ch2..ch5 也确实是**相邻麦克风**。因此: ")
+        print("        - `--audio-source mic0..mic3` 的通道号映射可用")
+        print("        - 具体哪个通道对应哪个物理角，本质上不可由本次测量区分")
+        print("          （需一个已知方位的声源才能定；对字幕用途无影响）")
+        if scrambles and scrambles[0][0] > best * 1.5:
+            print(f"      而乱序假设被强烈否定（RMS {scrambles[0][0]:.0f} vs "
+                  f"{best:.0f} µs）→ 四个通道不是任意顺序，是按环绕序排列")
+        return 0
+
+    print("\n结论: 恒等排列的拟合明显差于最优排列 →")
+    print("      ch2..ch5 **未必**就是 mic0..mic3 的环绕序。")
+    print("      最优几个候选（RMS 越小越好）:")
+    for err, p in ranked[:4]:
+        print(f"        RMS={err:5.1f} µs  "
+              + "".join(f"ch{RAW_CHANNELS[i]}=mic{p[i]} " for i in range(4)))
+    print("      `--audio-source micN` 的映射需按上表修正")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--nosep", type=int, default=4,
@@ -207,6 +402,9 @@ def main(argv=None) -> int:
     ap.add_argument("--save-only", action="store_true",
                     help="print no verdict; just record and save for offline "
                          "analysis")
+    ap.add_argument("--analyse", default=None,
+                    help="analyse a previously saved .npy and exit (no device "
+                         "needed): reports the TDOA verdict")
     ap.add_argument("--selftest", action="store_true",
                     help="check the verdict logic against synthetic patterns, "
                          "then exit (does not touch the device)")
@@ -214,6 +412,11 @@ def main(argv=None) -> int:
 
     if args.selftest:
         return _selftest()
+
+    if args.analyse:
+        data = np.load(args.analyse)
+        print(f"[p2] 离线分析 {args.analyse}  {data.shape}")
+        return tdoa_report(list(data))
 
     import sounddevice as sd
 
