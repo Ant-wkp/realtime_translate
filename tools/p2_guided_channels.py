@@ -51,6 +51,14 @@ CAPTURE_CHANNELS = 6
 RAW_CHANNELS = [2, 3, 4, 5]        # the four raw mic channels
 BLOCK = 1024
 
+# Metric window for the level statistic. A clap lasts a few milliseconds, so
+# averaging over the whole capture window dilutes it into the noise: a 5 ms
+# transient spread over 5 s loses ~30 dB and the channels then differ by only a
+# decibel or two, which is exactly what the first attempt measured. Taking the
+# maximum of short-window RMS keeps the transient's amplitude, which is the
+# quantity that actually varies with which microphone is nearest.
+METRIC_WINDOW = int(0.025 * SAMPLE_RATE)      # 25 ms
+
 # mic positions as the device itself reports them, used only to describe the
 # expected pattern in the output
 MIC_BEARINGS = {0: 315.0, 1: 45.0, 2: 135.0, 3: 225.0}
@@ -71,6 +79,26 @@ def rms(a: np.ndarray) -> np.ndarray:
     if a.size == 0:
         return np.zeros(CAPTURE_CHANNELS)
     return np.sqrt(np.mean(a.astype(np.float64) ** 2, axis=0))
+
+
+def peak_level(a: np.ndarray, window: int = METRIC_WINDOW) -> np.ndarray:
+    """Per-channel maximum of short-window RMS over the capture.
+
+    This is the statistic that survives a transient source. Plain RMS over the
+    whole window answers "how much energy in total", which for a clap is
+    dominated by the length of the window rather than by proximity; the maximum
+    of short-window RMS answers "how loud did it get", which is what proximity
+    actually controls.
+    """
+    if a.size < window:
+        return rms(a)
+    x = a.astype(np.float64)
+    n = x.shape[0] // window
+    if n == 0:
+        return rms(a)
+    frames = x[: n * window].reshape(n, window, x.shape[1])
+    per_window = np.sqrt(np.mean(frames ** 2, axis=1))     # (n, channels)
+    return per_window.max(axis=0)
 
 
 def drain(stream, seconds: float, keep: list | None = None) -> None:
@@ -104,7 +132,7 @@ def analyse(steps: list[np.ndarray], base_rms: np.ndarray) -> dict:
     """
     gains, loudest = [], []
     for x in steps:
-        live = rms(x)
+        live = peak_level(x)
         g = [live[c] / max(base_rms[c], 1e-9) for c in RAW_CHANNELS]
         gains.append(g)
         loudest.append(RAW_CHANNELS[int(np.argmax(g))])
@@ -125,7 +153,7 @@ def _selftest() -> int:
 
     def step(active: int, level: float = 30.0) -> np.ndarray:
         a = np.zeros((SAMPLE_RATE, CAPTURE_CHANNELS), dtype=np.float32)
-        a[:, active] = level      # a constant is fine: only RMS matters here
+        a[:, active] = level      # a constant is fine: only the level matters
         return a
 
     cases = [
@@ -172,7 +200,13 @@ def main(argv=None) -> int:
                     help="seconds of noise per position (default 5)")
     ap.add_argument("--settle", type=float, default=3.0)
     ap.add_argument("--device", type=int, default=None)
-    ap.add_argument("--save", default=None, help="write all captures to .npy")
+    ap.add_argument("--save", default="/tmp/p2_guided_channels.npy",
+                    help="write all captures to .npy (default "
+                         "/tmp/p2_guided_channels.npy, so a weak run can be "
+                         "re-analysed offline instead of repeated)")
+    ap.add_argument("--save-only", action="store_true",
+                    help="print no verdict; just record and save for offline "
+                         "analysis")
     ap.add_argument("--selftest", action="store_true",
                     help="check the verdict logic against synthetic patterns, "
                          "then exit (does not touch the device)")
@@ -229,9 +263,11 @@ def main(argv=None) -> int:
         say("[p2] 采集稳定。先录 2s 本底（请安静）...")
         drain(stream, 2.0, baseline)
         base = np.concatenate(baseline, axis=0)
-        base_rms = rms(base)
-        say("[p2] 本底: " + " ".join(f"ch{c}={base_rms[c]:.5f}"
-                                     for c in range(CAPTURE_CHANNELS)))
+        # the baseline uses the same statistic as the measurement, so the ratio
+        # compares like with like - a noise floor's own peaks against a clap's
+        base_rms = peak_level(base)
+        say("[p2] 本底(短窗峰值): " + " ".join(f"ch{c}={base_rms[c]:.5f}"
+                                                for c in range(CAPTURE_CHANNELS)))
 
         for i in range(args.nosep):
             say("")
@@ -255,18 +291,26 @@ def main(argv=None) -> int:
 
             x = np.concatenate(buf, axis=0)
             steps.append(x)
-            live = rms(x)
+            live = peak_level(x)
             # report the raw channels against the baseline so a too-quiet run is
             # caught now rather than producing a confident wrong answer later
             gain = [live[c] / max(base_rms[c], 1e-9) for c in RAW_CHANNELS]
             loud = max(gain)
+            second = sorted(gain)[-2] if len(gain) > 1 else 0.0
             say("    " + " ".join(f"ch{c} x{gain[k]:5.1f}"
                                   for k, c in enumerate(RAW_CHANNELS)))
+            # contrast matters as much as absolute level: if the best channel is
+            # only slightly above the runner-up, ranking them is a coin toss and
+            # the verdict would be noise dressed up as a mapping.
             if loud < 3.0:
-                say(f"    ⚠ 最响的原始通道只有本底的 {loud:.1f} 倍，可能太轻了；"
-                    f"建议重跑或下次更响一些")
+                say(f"    ⚠ 最响的原始通道只有本底的 {loud:.1f} 倍，太轻了；"
+                    f"请离近一点、拍得更用力，下次会更好")
+            elif loud < 1.3 * second:
+                say(f"    ⚠ 最响 {loud:.1f} 倍但次高 {second:.1f} 倍，区分度不足；"
+                    f"请更靠近某一颗麦克风")
             else:
-                say(f"    ✓ 最响为本底的 {loud:.1f} 倍")
+                say(f"    ✓ 最响 {loud:.1f} 倍，次高 {second:.1f} 倍（区分度 "
+                    f"{loud / max(second, 1e-9):.2f}x）")
 
     if control is not None:
         control.close()
@@ -278,6 +322,12 @@ def main(argv=None) -> int:
     say("=" * 72)
     say("")
     result = analyse(steps, base_rms)
+    if args.save_only:
+        np.save(args.save, np.stack(steps))
+        say(f"[p2] 已保存 {args.save}；未给判定（--save-only）")
+        np.save(args.save.replace(".npy", "_base.npy"), base_rms)
+        say(f"[p2] 本底已保存 {args.save.replace('.npy', '_base.npy')}")
+        return 0
     say("%6s %9s %9s %9s %9s   %s"
         % ("位置", *[f"ch{c}" for c in RAW_CHANNELS], "最响"))
     for i, g in enumerate(result["gains"]):
@@ -295,11 +345,30 @@ def main(argv=None) -> int:
     say(f"相邻步的位移(模 4): {result['diffs']}")
     say("")
 
+    # Contrast first: a clean rotation on weak data is still weak data. If the
+    # winning channel barely beats the runner-up, the "loudest" column is
+    # ranking noise and any verdict below would be an artefact of the window
+    # rather than a property of the array.
+    strong = 0
+    for gains in result["gains"]:
+        ordered = sorted(gains)
+        if ordered[-1] >= 3.0 and ordered[-1] >= 1.3 * ordered[-2]:
+            strong += 1
+    say(f"区分度合格的位置: {strong}/{len(result['gains'])} "
+        f"(需 3 倍以上且比次高高 30%)")
+    if strong < len(result["gains"]):
+        say("")
+        say(f"尚不能结论: 只有 {strong}/{len(result['gains'])} 个位置的信号足够强。")
+        say("      弱信号下『最响』可能只是在给噪声排名。请重跑：")
+        say("        - 离阵列更近（15~25cm）")
+        say("        - 每次持续拍手/敲击 5s 以上，要响")
+        say("        - 声源放在某个**角**上，而不是边中")
+        result["verdict"] = "weak"
     # A rotation can only be established if the source actually went all the
     # way round: with fewer positions than channels the pattern is necessarily
     # consistent, so a clean "forward" there would be an artefact of having
     # asked too few questions rather than a finding.
-    if args.nosep < len(RAW_CHANNELS):
+    elif args.nosep < len(RAW_CHANNELS):
         say(f"尚不能结论: 只测了 {args.nosep} 个位置，而原始通道有 "
             f"{len(RAW_CHANNELS)} 个。要定下四点循环必须至少走满一圈，"
             f"请用 --nosep {len(RAW_CHANNELS)}（或 8 以交叉验证）重跑。")
