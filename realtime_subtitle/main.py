@@ -323,6 +323,24 @@ def parse_args(argv=None):
                         f"reads up to ~43000 and clapping reaches ~2.4M)")
     p.add_argument("--audio-source", default="conference",
                    choices=["conference", "asr", "mic0", "mic1", "mic2", "mic3"])
+    p.add_argument("--beam-lanes", nargs=2, type=float, metavar=("AZ1", "AZ2"),
+                   default=None,
+                   help="run two caption lanes, one per fixed beam, steered to "
+                        "these azimuths (degrees). Routes OP_L/OP_R to beam 1 "
+                        "and beam 2, which measurement confirms is (7,0) and "
+                        "(7,1). Omit for the single-lane behaviour")
+    p.add_argument("--beam-lane-channels", nargs=2, type=int, metavar=("CH0", "CH1"),
+                   default=(0, 1),
+                   help="capture channels for the two lanes (default 0 1, which "
+                        "is where OP_L/OP_R land)")
+    p.add_argument("--beam-no-route", action="store_true",
+                   help="with --beam-lanes, do not write OP_L/OP_R or steer: "
+                        "capture the two channels as they already are. For "
+                        "checking the audio split without touching the device")
+    p.add_argument("--beam-lane-labels", nargs=2, metavar=("L0", "L1"),
+                   default=None,
+                   help="override the lane labels (default: looked up from the "
+                        "DOA zone table by each lane's azimuth)")
     p.add_argument("--ch", type=int, default=None, help="explicit channel index (0-based)")
     p.add_argument("--in-channels", type=int, default=None)
     p.add_argument("--device", default=None, help="input device name substring")
@@ -681,19 +699,93 @@ def main(argv=None) -> int:
 
     # In single-lane mode the segmenter keeps the caller's original sw_vad
     # object, so nothing about it changes; extra lanes get their own.
+    #
+    # The lane list is built once, from the mode, rather than starting with a
+    # default lane and appending: appending left the default lane in place, so
+    # a dual-lane run came up with three lanes, two of them on the same
+    # channel, and their indices no longer matched their beams.
     lanes: list[Lane] = []
-    lane0 = Lane(index=0, channel=ch_index, beam_index=0,
-                 azimuth=0.0, label="", tag="",
-                 energy_threshold=args.beam_energy_threshold,
-                 segmenter=Segmenter(seg_cfg, sw_vad, lane=0), vad=sw_vad,
-                 locator=locator)
-    lanes.append(lane0)
-    for ln in lanes[1:]:                     # no extra lanes yet (P4 adds them)
-        ln.vad = SileroVad(threshold=SW_FRAME_THRESHOLD)
-        ln.segmenter = Segmenter(seg_cfg, ln.vad, lane=ln.index,
-                                 azimuth=ln.azimuth, label=ln.label,
-                                 tag=ln.tag)
-        ln.locator = SpeakerLocator()
+
+    # ---- dual lane ------------------------------------------------------
+    # Measurement settled how this is wired: OP_L/OP_R are the two
+    # programmable outputs, they land on capture channels 0 and 1, and the
+    # ASR-output category indexes beams, so (7,0) and (7,1) are beam 1 and
+    # beam 2. That is the whole configuration - no beam scan is needed.
+    beam_router = None
+    beam_steer = None
+    if args.beam_lanes is not None and args.vad_gate == "and":
+        # `and` keys on the device-wide hardware speech flag, which cannot tell
+        # the lanes apart: both would open on either talker. The per-beam
+        # energy gate is the one that can, so a dual-lane run defaults to it.
+        # Single-lane runs are untouched and keep `and`.
+        print("[lane] dual lane implies --vad-gate energy (the hardware flag "
+              "is device-wide and cannot separate the lanes)")
+        args.vad_gate = "energy"
+
+    if args.beam_lanes is None:
+        lanes.append(Lane(index=0, channel=ch_index, beam_index=0,
+                          energy_threshold=args.beam_energy_threshold,
+                          segmenter=Segmenter(seg_cfg, sw_vad, lane=0),
+                          vad=sw_vad, locator=locator))
+    else:
+        chans = list(args.beam_lane_channels)
+        if len(set(chans)) != 2 or max(chans) >= in_channels:
+            print(f"[lane] bad --beam-lane-channels {chans} for {in_channels} "
+                  f"capture channels")
+            return 2
+        labels = args.beam_lane_labels
+        for i, (az, ch) in enumerate(zip(args.beam_lanes, chans)):
+            # The label comes from the configured bearing, not from the
+            # device's DOA: that reading is a free-running estimate which
+            # drifts around the room when nobody is talking, whereas the
+            # bearing here is a value we chose and the zone table is the
+            # operator's own naming of it.
+            az %= 360.0
+            lbl = labels[i] if labels else locator.label_for(az)
+            ln = Lane(index=i, channel=ch, beam_index=i, azimuth=az,
+                      label=lbl, tag=f"lane{i}({lbl}) ",
+                      energy_threshold=args.beam_energy_threshold)
+            ln.vad = SileroVad(threshold=SW_FRAME_THRESHOLD)
+            ln.segmenter = Segmenter(seg_cfg, ln.vad, lane=ln.index,
+                                     azimuth=ln.azimuth, label=ln.label,
+                                     tag=ln.tag)
+            ln.locator = SpeakerLocator()
+            lanes.append(ln)
+        if labels and labels[0] == labels[1]:
+            print(f"[lane] WARNING: both lanes are labelled {labels[0]!r}; "
+                  f"the subtitle badges will be indistinguishable")
+        print(f"[lane] {len(lanes)} lanes, channels {[l.channel for l in lanes]}, "
+              f"beams {[l.beam_index for l in lanes]}, "
+              f"labels {[l.label for l in lanes]}")
+        # Gating fixed beams would silence one lane whenever the other is
+        # louder, which is exactly what two lanes must not do - so the two
+        # lanes need both beams live, the opposite of the single-lane
+        # fixed-beam setup which relies on gating.
+        if device is not None and not args.beam_no_route:
+            from .beam_router import (CAT_ASR_OUTPUT, BeamRouter,
+                                      FixedBeamController)
+
+            beam_router = BeamRouter(device)
+            beam_steer = FixedBeamController(device)
+            for slot, beam in (("L", 0), ("R", 1)):
+                res = beam_router.route_slot(slot, CAT_ASR_OUTPUT, beam)
+                print(f"[lane] route OP_{slot} -> (7,{beam})={'ok' if res.get('ok') else res}")
+                if not res.get("ok"):
+                    beam_router.restore()
+                    return 1
+            res = beam_steer.steer(args.beam_lanes[0], args.beam_lanes[1],
+                                   gating=False)
+            print(f"[lane] steer {args.beam_lanes} gating=off -> "
+                  f"{'ok' if res.get('ok') else res}")
+            if not res.get("ok"):
+                beam_steer.restore()
+                beam_router.restore()
+                return 1
+        elif args.beam_no_route:
+            print("[lane] --beam-no-route: leaving routing and beam angles "
+                  "untouched (capture only)")
+
+    _lane_route_owner = (beam_router, beam_steer)
 
     def audio_callback(indata, frames, time_info, status):
         """Fan one capture block out to every lane's own queue.
@@ -975,12 +1067,26 @@ def main(argv=None) -> int:
         if fn:
             print(f"[首字] 汇总: {fn} 句有 partial, 均值 {fsum / fn:.2f}s"
                   + (f", 另 {fmiss} 句太短无 partial" if fmiss else ""))
+        with first_char_lock:
+            for ln in lanes:
+                if ln.segmenter.counters.flushed or ln.segmenter.counters.discarded:
+                    print(f"[seg] {ln.segmenter.summary()}")
         if vad_reader:
             vad_reader.stop()
         # put the beam configuration back if we were holding a steering change
         if beam_controller is not None:
             print(f"[beam] restoring original beam config: "
                   f"{beam_controller.restore()}")
+        # dual-lane runs changed both the steering and the output routing, and
+        # both have to go back: leaving the routing behind would have the unit
+        # boot into a state nobody chose
+        if _lane_route_owner[0] is not None:
+            print(f"[lane] restoring output routing: "
+                  f"{_lane_route_owner[0].restore()} "
+                  f"-> {_lane_route_owner[0].recon()['op_all']}")
+        if _lane_route_owner[1] is not None:
+            print(f"[lane] restoring beam steering: "
+                  f"{_lane_route_owner[1].restore()}")
         transcriber.stop()
         final_decode.stop()
         translation.stop()
