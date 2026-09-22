@@ -6,7 +6,6 @@ onnxruntime
 ctranslate2
 sentencepiece
 pyusb
-faster-whisper
 funasr
 modelscope
 torch
