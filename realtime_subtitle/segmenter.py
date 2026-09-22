@@ -171,10 +171,10 @@ class Segmenter:
              now: float) -> list[Action]:
         """Consume one tick. Returns the Actions the caller must perform.
 
-        `chunks` is this tick's audio for this lane and `gate_fn` is the
-        caller's gate verdict callback, `gate_fn(sw_prob) -> bool`. The
-        software VAD probability is computed here, once, so that it drives the
-        gate verdict, the statistics and the end-of-utterance confirmation from
+        `chunks` is this tick's audio and `gate_fn` is the caller's gate
+        verdict callback, `gate_fn(sw_prob) -> bool`. The software VAD
+        probability is computed here, once, so that it drives the gate
+        verdict, the statistics and the end-of-utterance confirmation from
         a single consistent reading. `hw_vad` only feeds the diagnostic
         hardware-tick counter.
         """
