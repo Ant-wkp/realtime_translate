@@ -57,7 +57,7 @@ class ScriptedVad:
 
 def make(probs, **cfg):
     cfg.setdefault("max_seconds", 20.0)
-    seg = Segmenter(SegmentCfg(**cfg), ScriptedVad(probs), lane=0)
+    seg = Segmenter(SegmentCfg(**cfg), ScriptedVad(probs))
     return seg
 
 
@@ -138,7 +138,7 @@ class TestFilters(unittest.TestCase):
         # (gate open every voiced tick), but the audio itself is near silence
         probs = [0.9] * 12 + [0.02] * 8
         seg = Segmenter(SegmentCfg(min_seconds=0.3, max_seconds=20.0),
-                        ScriptedVad(probs), lane=0)
+                        ScriptedVad(probs))
         acts = []
         for i, p in enumerate(probs):
             gate = p >= 0.5
@@ -157,7 +157,7 @@ class TestFilters(unittest.TestCase):
         seg = Segmenter(SegmentCfg(min_seconds=0.3, max_seconds=20.0,
                                    short_exempt_seconds=0.0,
                                    silence_hold=99.0),
-                        ScriptedVad(probs), lane=0)
+                        ScriptedVad(probs))
         acts = drive(seg, probs)
         disc = [a for a in acts if a.kind == "discard"]
         self.assertEqual(len(disc), 1)
@@ -282,10 +282,11 @@ class TestDiagnostics(unittest.TestCase):
         self.assertRegex(lines[1], r"^\[VAD\] discard \w+ \(duration .*\): "
                                    r"dur=\d+\.\d{2}s ratio=")
 
-    def test_lane_tag_prefix(self):
+    def test_diagnostic_line_wording(self):
+        # wording and order of the [seg]/[flush] lines, as the inline loop
+        # printed them
         seg = Segmenter(SegmentCfg(debug=True),
-                        ScriptedVad([0.9] * 12 + [0.02] * 8), lane=1,
-                        label="left", tag="lane1(left) ")
+                        ScriptedVad([0.9] * 12 + [0.02] * 8))
         acts = []
         probs = [0.9] * 12 + [0.02] * 8
         for i, p in enumerate(probs):
@@ -293,8 +294,8 @@ class TestDiagnostics(unittest.TestCase):
             acts += seg.feed([LOUD], lambda prob, g=gate: g,
                              1 if p >= 0.2 else 0, i * TICK)
         fl = [a for a in acts if a.kind == "flush"][0]
-        self.assertTrue(fl.flush_line.startswith("lane1(left) [seg] flush"))
-        self.assertTrue(fl.debug_line.startswith("lane1(left) [flush]"))
+        self.assertTrue(fl.flush_line.startswith("[seg] flush"))
+        self.assertTrue(fl.debug_line.startswith("[flush]"))
 
 
 class TestTrimTail(unittest.TestCase):

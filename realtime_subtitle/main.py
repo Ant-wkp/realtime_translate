@@ -21,7 +21,6 @@ import queue
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -61,77 +60,12 @@ SHORT_EXEMPT_MAX_PROB = 0.5 # peak probability required for exemption
 RATIO_THRESHOLD = 0.35      # segment speech-frame ratio floor
 TRIM_TAIL_ENERGY = 1e-4     # RMS below which tail frames are trimmed
 
-# Default per-beam energy floor for the `energy` gate, from what the array
-# actually reports: a quiet room reads 0..42916 and clapping reaches
-# 2.4M..4.3M, so this sits five times above the loudest noise floor and an
-# order of magnitude below speech. It is a starting point for calibration
-# against real voices, not a tuned value.
-BEAM_ENERGY_THRESHOLD = 200000.0
-
-
-@dataclass
-class Lane:
-    """One independent caption channel: its own audio, VAD and segment state.
-
-    Everything that must not be shared lives here, and the list is not
-    arbitrary. SileroVad keeps RNN state inside the model object, so two lanes
-    sharing one instance would corrupt each other's probabilities exactly the
-    way two streams sharing one ASR cache dict would. The confirm-gate
-    counters are the same kind of state: shared, a hardware tick in one lane
-    would advance the other lane's rejection count. Each lane also gets its
-    own SpeakerLocator so a reset at segment open cannot clear the other
-    lane's tally.
-    """
-
-    index: int
-    channel: int                     # capture channel index
-    beam_index: int = 0              # 0 = beam1, 1 = beam2
-    azimuth: float = 0.0
-    label: str = ""
-    tag: str = ""                    # log prefix; empty in single-lane mode
-    energy_threshold: float = BEAM_ENERGY_THRESHOLD
-    queue: queue.Queue = field(default_factory=queue.Queue)
-    # most recent control-plane readings (shared source, per-tick snapshot)
-    hw_vad: int = 0
-    energy: list[float] = field(default_factory=list)
-    # gate state, per lane
-    confirm_pending: bool = False
-    confirm_sw_reject: int = 0
-    # `energy` mode needs a hold: SPENERGY reads exactly 0 the instant nobody
-    # is talking, so a gate on the instantaneous value would drop the lane
-    # during every inter-word pause and chop sentences. Hold the last active
-    # reading for as long as the segmenter's own silence hold, which is the
-    # same question ("is this utterance still going?") asked of the same
-    # signal, so the two agree by construction rather than by coincidence.
-    energy_active_at: float = 0.0
-    segmenter: object = None
-    vad: object = None
-    locator: object = None
-
-    def energy_active(self, now: float, hold: float) -> bool:
-        """Whether this lane's beam has heard anything recently."""
-        if not self.energy:
-            # no control plane (audio-only run): never let the gate block
-            return True
-        idx = self.beam_index if self.beam_index < len(self.energy) else 0
-        if self.energy[idx] > self.energy_threshold:
-            self.energy_active_at = now
-            return True
-        return (now - self.energy_active_at) < hold
-
 
 class VadDoaReader(threading.Thread):
-    """Poll DOA_VALUE (angle + speech activity) and per-beam energy.
+    """Poll DOA_VALUE (angle + speech activity) off the control plane.
 
     Isolates USB control transfers (which can block 1 s+ on RETRY storms)
     from the strictly-paced main loop.
-
-    AEC_SPENERGY_VALUES is read alongside DOA_VALUE because it is the only
-    per-beam signal the device exposes: DOA_VALUE[1] is a single device-wide
-    speech flag and cannot say which beam heard anything, so it cannot gate
-    two lanes independently. The beam energies are also the one reading that
-    stays valid over long distances, being a per-beam scalar rather than a set
-    of relative delays.
     """
 
     def __init__(self, device, interval: float = 0.1):
@@ -147,16 +81,10 @@ class VadDoaReader(threading.Thread):
                 vals = self.device.read("DOA_VALUE")
                 azimuth = vals[0] if vals else None
                 hw_vad = int(vals[1]) if len(vals) > 1 else 0
-                try:
-                    energy = [float(v) for v in
-                              self.device.read("AEC_SPENERGY_VALUES")]
-                except Exception:  # noqa: BLE001 - energy is an extra, not a
-                    energy = []     # reason to lose the VAD reading
                 self.vad_queue.put({"hw_vad": hw_vad, "doa": azimuth,
-                                    "energy": energy, "error": False})
+                                    "error": False})
             except Exception:  # noqa: BLE001
-                self.vad_queue.put({"hw_vad": 0, "doa": None, "energy": [],
-                                    "error": True})
+                self.vad_queue.put({"hw_vad": 0, "doa": None, "error": True})
             time.sleep(self.interval)
 
     def stop(self) -> None:
@@ -239,11 +167,9 @@ class FinalDecodeThread(threading.Thread):
         self.job_queue: queue.Queue = queue.Queue()
         self._stop = threading.Event()
 
-    def submit(self, task_id: str, audio, doa: str = "", partial_hint: str = "",
-               lane: int = 0) -> None:
+    def submit(self, task_id: str, audio, doa: str = "", partial_hint: str = "") -> None:
         self.job_queue.put({"task_id": task_id, "audio": audio,
-                            "doa": doa, "partial_hint": partial_hint,
-                            "lane": lane})
+                            "doa": doa, "partial_hint": partial_hint})
 
     def run(self) -> None:
         while not self._stop.is_set():
@@ -284,7 +210,6 @@ class FinalDecodeThread(threading.Thread):
                     "mode": mode,
                     "task_id": job["task_id"],
                     "doa": job["doa"],
-                    "lane": job.get("lane", 0),
                     "final_replaces_partial": True,
                     "partial_hint": job["partial_hint"],
                 },
@@ -300,48 +225,18 @@ class FinalDecodeThread(threading.Thread):
 # ---------------------------------------------------------------------------
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="reSpeaker real-time bilingual subtitles")
-    p.add_argument("--asr", choices=["funasr", "whisper"], default="funasr")
-    p.add_argument("--model", default="tiny", help="whisper model size")
-    # Streaming 2-pass is the default: partials are what make subtitles feel
-    # live, so it takes --no-streaming to opt out rather than a flag to opt in.
-    p.add_argument("--streaming", dest="streaming", action="store_true", default=True,
-                   help="FunASR streaming 2-pass with partial results (default)")
-    p.add_argument("--no-streaming", dest="streaming", action="store_false",
-                   help="disable streaming: decode whole segments offline only")
     p.add_argument("--asr-chunk-size", choices=["480", "600"], default="480",
                    help="streaming decode stride: 480ms (default, lower latency) "
                         "or 600ms (upstream default, longer lookahead)")
-    p.add_argument("--vad-gate", choices=["hw", "and", "confirm", "energy"],
-                   default="and",
-                   help="energy adds a per-beam SPENERGY floor; on multiple "
-                        "lanes it is the only gate that can tell the lanes "
-                        "apart, since the hardware speech flag is device-wide")
-    p.add_argument("--beam-energy-threshold", type=float,
-                   default=BEAM_ENERGY_THRESHOLD,
-                   help=f"per-beam SPENERGY floor for --vad-gate energy "
-                        f"(default {BEAM_ENERGY_THRESHOLD:.0f}; a quiet room "
-                        f"reads up to ~43000 and clapping reaches ~2.4M)")
     p.add_argument("--audio-source", default="conference",
-                   choices=["conference", "asr", "mic0", "mic1", "mic2", "mic3"])
-    p.add_argument("--beam-lanes", nargs=2, type=float, metavar=("AZ1", "AZ2"),
-                   default=None,
-                   help="run two caption lanes, one per fixed beam, steered to "
-                        "these azimuths (degrees). Routes OP_L/OP_R to beam 1 "
-                        "and beam 2, which measurement confirms is (7,0) and "
-                        "(7,1). Omit for the single-lane behaviour")
-    p.add_argument("--beam-lane-channels", nargs=2, type=int, metavar=("CH0", "CH1"),
-                   default=(0, 1),
-                   help="capture channels for the two lanes (default 0 1, which "
-                        "is where OP_L/OP_R land)")
-    p.add_argument("--beam-no-route", action="store_true",
-                   help="with --beam-lanes, do not write OP_L/OP_R or steer: "
-                        "capture the two channels as they already are. For "
-                        "checking the audio split without touching the device")
-    p.add_argument("--beam-lane-labels", nargs=2, metavar=("L0", "L1"),
-                   default=None,
-                   help="override the lane labels (default: looked up from the "
-                        "DOA zone table by each lane's azimuth)")
-    p.add_argument("--ch", type=int, default=None, help="explicit channel index (0-based)")
+                   choices=["conference", "asr"],
+                   help="which processed output to recognize: 'conference' is "
+                        "the full AEC+beam+post-processing chain, 'asr' is the "
+                        "shorter beamformer output")
+    p.add_argument("--ch", type=int, default=None,
+                   help="explicit capture channel index (0-based), overriding "
+                        "--audio-source. 0/1 are the two processed outputs, "
+                        "2-5 the raw microphones")
     p.add_argument("--in-channels", type=int, default=None)
     p.add_argument("--device", default=None, help="input device name substring")
     p.add_argument("--port", type=int, default=8765)
@@ -354,29 +249,6 @@ def parse_args(argv=None):
                         "first streaming chunk is filled from this ring buffer "
                         "so the model decodes the opening words immediately "
                         "instead of waiting 600ms for a full chunk")
-    p.add_argument("--beam-recon", action="store_true", help="read-only beam probe then exit")
-    p.add_argument("--beam-channels", action="store_true",
-                   help="read-only survey of how the two programmable outputs "
-                        "map onto capture channels, then exit")
-    p.add_argument("--beam-probe", action="store_true",
-                   help="read-only survey of every beam parameter then exit")
-    p.add_argument("--beam-scan", action="store_true",
-                   help="sweep the steered beams to locate where speech is "
-                        "(someone must keep talking during the sweep)")
-    p.add_argument("--beam-scan-step", type=float, default=30.0,
-                   help="scan step in degrees (default 30; the two beams are "
-                        "placed 180 apart, so 6 steps cover the circle)")
-    p.add_argument("--beam-fixed", nargs=2, type=float, metavar=("AZ1", "AZ2"),
-                   default=None,
-                   help="steer the two fixed beams to these azimuths (degrees, "
-                        "0 = array front) and enable energy gating")
-    p.add_argument("--beam-fixed-no-gating", action="store_true",
-                   help="with --beam-fixed, leave both beams live instead of "
-                        "letting speech energy silence the inactive one")
-    p.add_argument("--beam-apply-in-run", action="store_true",
-                   help="keep the fixed-beam steering applied while subtitles "
-                        "run (default is to steer, report and restore)")
-    p.add_argument("--beam-select", action="store_true", help="apply beam route then exit")
     p.add_argument("--list-devices", action="store_true")
     p.add_argument("--debug-gate", action="store_true",
                    help="print per-tick gate inputs and every discard reason")
@@ -411,17 +283,22 @@ def resolve_input_device(name: str | None) -> int:
 
 
 def resolve_audio_channel(args, in_channels: int) -> tuple[int, str]:
+    """Pick the capture channel.
+
+    Only the two processed outputs are offered by name because those are the
+    only ones with different DSP chains behind them; anything else is reached
+    with --ch. The array's four raw microphones sit on channels 2-5 and are
+    fixed per-microphone, so naming them added no capability over the index.
+    """
     if args.ch is not None:
         return args.ch, f"ch{args.ch + 1} (explicit)"
-    mapping = {"conference": 0, "asr": 1, "mic0": 2, "mic1": 3, "mic2": 4, "mic3": 5}
-    idx = mapping.get(args.audio_source, 0)
+    mapping = {"conference": 0, "asr": 1}
+    idx = mapping[args.audio_source]
     if idx >= in_channels:
         idx = 0
     desc = {
         "conference": "Conference processed output (AEC+beam+post)",
         "asr": "ASR beam output (auto-select, no post)",
-        "mic0": "raw mic 0", "mic1": "raw mic 1",
-        "mic2": "raw mic 2", "mic3": "raw mic 3",
     }[args.audio_source]
     return idx, desc
 
@@ -447,117 +324,6 @@ def main(argv=None) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"[USB] control plane unavailable: {exc}")
 
-    if args.beam_probe:
-        if device is None:
-            print("[beam] probe requires the USB control plane")
-            return 1
-        from .beam_router import FixedBeamController
-
-        survey = FixedBeamController(device).probe()
-        for name, val in survey.items():
-            print(f"[beam] {name} = {val}")
-        return 0
-
-    if args.beam_scan:
-        if device is None:
-            print("[beam] scan requires the USB control plane")
-            return 1
-        from .beam_router import FixedBeamController
-
-        controller = FixedBeamController(device)
-        print(f"[beam] scanning in {args.beam_scan_step:g}° steps - "
-              f"请持续说话让扫描能找到你…")
-        scan = controller.scan(step_deg=args.beam_scan_step)
-        for s in scan.get("steps", []):
-            print(f"  beam1={s['beam1_deg']:5.1f}°  beam2={s['beam2_deg']:5.1f}°  "
-                  f"E1={s['e1']:10.0f}  E2={s['e2']:10.0f}")
-        if not scan.get("ok"):
-            print(f"[beam] scan failed: {scan.get('reason')}")
-            return 1
-        print(f"[beam] {scan['hint']}")
-        if scan.get("second"):
-            s = scan["second"]
-            print(f"[beam] 次峰在 {s['deg']:.0f}° (E={s['energy']:.0f})")
-            print(f"[beam] 可试用: --beam-fixed {scan['peak']['deg']:.0f} "
-                  f"{s['deg']:.0f}")
-        elif not scan["silent"]:
-            print("[beam] 只找到一个峰，未给出第二方位（可能只有一人说话）")
-        # the sweep always restores; re-steering here would be a second,
-        # unreported write, so the caller decides using the printed angles
-        print("[beam] 设备已恢复扫描前状态；如需应用请用上面的 --beam-fixed")
-        return 0
-
-    beam_controller = None
-    if args.beam_fixed is not None:
-        if device is None:
-            print("[beam] fixed-beam steering requires the USB control plane")
-            return 1
-        from .beam_router import FixedBeamController
-
-        beam_controller = FixedBeamController(device)
-        result = beam_controller.steer(
-            args.beam_fixed[0], args.beam_fixed[1],
-            gating=not args.beam_fixed_no_gating)
-        print(f"[beam] steer {args.beam_fixed} gating="
-              f"{not args.beam_fixed_no_gating} -> {result}")
-        if not result.get("ok"):
-            return 1
-        if not args.beam_apply_in_run:
-            # report, then hand the array back exactly as it was found: a
-            # measurement run must not leave the beams pointing somewhere the
-            # operator never chose
-            print(f"[beam] restoring original beam config: "
-                  f"{beam_controller.restore()}")
-            beam_controller = None
-
-    if args.beam_recon or args.beam_select:
-        if device is None:
-            print("beam tools require the USB control plane")
-            return 1
-        from .beam_router import BeamRouter
-
-        router = BeamRouter(device)
-        recon = router.recon()
-        info = router.describe(recon["op_all"])
-        print(f"[beam] AUDIO_MGR_OP_ALL={recon['op_all']}")
-        print(f"[beam] describe={info}")
-        if args.beam_select:
-            if not info.get("ok"):
-                print("[beam] mapping ambiguous, refusing to write")
-                return 1
-            candidate = info["pairs"][2]
-            print(f"[beam] applying candidate {candidate} -> slot R")
-            print(router.apply(candidate, "R"))
-        return 0
-
-    if args.beam_channels:
-        if device is None:
-            print("[beam] channel survey requires the USB control plane")
-            return 1
-        from .beam_router import (SLOT_CHANNEL, BeamRouter, describe_pair,
-                                  pair_name)
-
-        router = BeamRouter(device)
-        op_all = router.recon()["op_all"]
-        print(f"[beam] AUDIO_MGR_OP_ALL={op_all}")
-        print("[beam] the two programmable outputs and where they land:")
-        for slot in ("L", "R"):
-            cat, src = router.current_pair(slot)
-            print(f"[beam]   OP_{slot} = {describe_pair(cat, src)}"
-                  f"  -> capture ch{SLOT_CHANNEL[slot]}")
-        print("[beam] the remaining slots of the routing table:")
-        for i, pair in enumerate(router.recon()["pairs"]):
-            slot = "L" if i < 3 else "R"
-            note = ("first source" if i % 3 == 0
-                    else f"packed source {i % 3}")
-            print(f"[beam]   {slot}/{note}: {describe_pair(*pair)}")
-        print("[beam] capture ch2-5 are fixed per-mic channels and are not "
-              "selected by OP_L/OP_R; to confirm that on this unit, use "
-              "tools/p2_channel_probe.py (needs a played stimulus)")
-        print("[beam] category numbers are observations from this device, not "
-              "a documented enumeration - unknown ones print as cat?N")
-        return 0
-
     # ---- audio input ---------------------------------------------------
     input_device = resolve_input_device(args.device)
     dev_info = sd.query_devices(input_device, "input")
@@ -571,23 +337,17 @@ def main(argv=None) -> int:
     locator = SpeakerLocator()
 
     # ---- inference providers --------------------------------------------
-    if args.asr == "funasr":
-        from .funasr_provider import FunasrProvider
+    # Streaming 2-pass is the only mode: partials are what make subtitles feel
+    # live, and the offline pass already runs for the final text, so an opt-out
+    # would only remove the intermediate result without changing what the
+    # recognizer hears.
+    from .funasr_provider import FunasrProvider
 
-        chunk = (FunasrProvider.CHUNK_SIZE_480 if args.asr_chunk_size == "480"
-                 else FunasrProvider.CHUNK_SIZE_600)
-        provider = FunasrProvider(chunk_size=chunk)
-        if args.streaming:
-            stride_ms = chunk[1] * 60
-            print(f"[ASR] FunASR Paraformer (zh, streaming 2pass, "
-                  f"stride {stride_ms}ms)")
-        else:
-            print("[ASR] FunASR Paraformer (zh, offline)")
-    else:
-        from .whisper_provider import WhisperProvider
-
-        provider = WhisperProvider(args.model)
-        print(f"[ASR] Whisper {args.model}")
+    chunk = (FunasrProvider.CHUNK_SIZE_480 if args.asr_chunk_size == "480"
+             else FunasrProvider.CHUNK_SIZE_600)
+    provider = FunasrProvider(chunk_size=chunk)
+    print(f"[ASR] FunASR Paraformer (zh, streaming 2pass, "
+          f"stride {chunk[1] * 60}ms)")
 
     from .translator import NllbCTranslate2Provider
 
@@ -627,7 +387,7 @@ def main(argv=None) -> int:
     def on_asr_result(result):
         result_queue.put(result)
 
-    def on_partial(stream_id, text, lane: int = 0):
+    def on_partial(stream_id, text):
         # first-character latency: first non-empty partial after the segment
         # opened. This is the number the pre-roll seed is meant to shrink -
         # the [耗时] line measures "after speech ended", which is a different
@@ -647,10 +407,7 @@ def main(argv=None) -> int:
                         print(f"[首字] {stream_id[:8]} 张嘴→首字: {dt:.2f}s "
                               f"(均值 {avg:.2f}s / {n} 句, seed {seed:.2f}s)")
         server.broadcast({
-            "type": "partial", "id": stream_id, "ts": time.time(),
-            "text": text,
-            "lane": lane,
-            "lane_label": (lanes[lane].label if lane < len(lanes) else ""),
+            "type": "partial", "id": stream_id, "ts": time.time(), "text": text,
         })
 
     from .transcriber import TranscriberWorker
@@ -665,7 +422,7 @@ def main(argv=None) -> int:
         audio = (trim_tail(req.audio, TRIM_TAIL_ENERGY)
                  if req.audio is not None and req.audio.size else req.audio)
         final_decode.submit(req.task_id, audio, doa=req.doa,
-                            partial_hint=req.partial_hint, lane=req.lane)
+                            partial_hint=req.partial_hint)
 
     transcriber = TranscriberWorker(provider, on_result=on_asr_result,
                                     on_partial=on_partial,
@@ -679,14 +436,8 @@ def main(argv=None) -> int:
 
     # ---- segmentation state machine ---------------------------------
     # All of the per-segment bookkeeping (gate, pre-roll ring, silence hold,
-    # flush filters) lives in Segmenter so that it can run once per lane and
-    # so this loop stays a transaction: drain, feed, act on the returned
-    # Actions. See segmenter.py.
-    #
-    # A single lane is not a special case: it is a one-element lane list, so
-    # the code below has one shape instead of two. That is what makes the
-    # "single-lane behaviour is unchanged" claim testable - there is no second
-    # path that could drift from the first.
+    # flush filters) lives in Segmenter so that this loop stays a transaction:
+    # drain, feed, act on the returned Actions. See segmenter.py.
     seg_cfg = SegmentCfg(min_seconds=args.min_seconds,
                          max_seconds=args.max_seconds,
                          silence_hold=args.silence_hold,
@@ -697,151 +448,32 @@ def main(argv=None) -> int:
                          trim_tail_energy=TRIM_TAIL_ENERGY,
                          debug=args.debug_gate)
 
-    # In single-lane mode the segmenter keeps the caller's original sw_vad
-    # object, so nothing about it changes; extra lanes get their own.
-    #
-    # The lane list is built once, from the mode, rather than starting with a
-    # default lane and appending: appending left the default lane in place, so
-    # a dual-lane run came up with three lanes, two of them on the same
-    # channel, and their indices no longer matched their beams.
-    lanes: list[Lane] = []
+    segmenter = Segmenter(seg_cfg, sw_vad)
 
-    # ---- dual lane ------------------------------------------------------
-    # Measurement settled how this is wired: OP_L/OP_R are the two
-    # programmable outputs, they land on capture channels 0 and 1, and the
-    # ASR-output category indexes beams, so (7,0) and (7,1) are beam 1 and
-    # beam 2. That is the whole configuration - no beam scan is needed.
-    beam_router = None
-    beam_steer = None
-    if args.beam_lanes is not None and args.vad_gate == "and":
-        # `and` keys on the device-wide hardware speech flag, which cannot tell
-        # the lanes apart: both would open on either talker. The per-beam
-        # energy gate is the one that can, so a dual-lane run defaults to it.
-        # Single-lane runs are untouched and keep `and`.
-        print("[lane] dual lane implies --vad-gate energy (the hardware flag "
-              "is device-wide and cannot separate the lanes)")
-        args.vad_gate = "energy"
-
-    if args.beam_lanes is None:
-        lanes.append(Lane(index=0, channel=ch_index, beam_index=0,
-                          energy_threshold=args.beam_energy_threshold,
-                          segmenter=Segmenter(seg_cfg, sw_vad, lane=0),
-                          vad=sw_vad, locator=locator))
-    else:
-        chans = list(args.beam_lane_channels)
-        if len(set(chans)) != 2 or max(chans) >= in_channels:
-            print(f"[lane] bad --beam-lane-channels {chans} for {in_channels} "
-                  f"capture channels")
-            return 2
-        labels = args.beam_lane_labels
-        for i, (az, ch) in enumerate(zip(args.beam_lanes, chans)):
-            # The label comes from the configured bearing, not from the
-            # device's DOA: that reading is a free-running estimate which
-            # drifts around the room when nobody is talking, whereas the
-            # bearing here is a value we chose and the zone table is the
-            # operator's own naming of it.
-            az %= 360.0
-            lbl = labels[i] if labels else locator.label_for(az)
-            ln = Lane(index=i, channel=ch, beam_index=i, azimuth=az,
-                      label=lbl, tag=f"lane{i}({lbl}) ",
-                      energy_threshold=args.beam_energy_threshold)
-            ln.vad = SileroVad(threshold=SW_FRAME_THRESHOLD)
-            ln.segmenter = Segmenter(seg_cfg, ln.vad, lane=ln.index,
-                                     azimuth=ln.azimuth, label=ln.label,
-                                     tag=ln.tag)
-            ln.locator = SpeakerLocator()
-            lanes.append(ln)
-        if labels and labels[0] == labels[1]:
-            print(f"[lane] WARNING: both lanes are labelled {labels[0]!r}; "
-                  f"the subtitle badges will be indistinguishable")
-        print(f"[lane] {len(lanes)} lanes, channels {[l.channel for l in lanes]}, "
-              f"beams {[l.beam_index for l in lanes]}, "
-              f"labels {[l.label for l in lanes]}")
-        # Gating fixed beams would silence one lane whenever the other is
-        # louder, which is exactly what two lanes must not do - so the two
-        # lanes need both beams live, the opposite of the single-lane
-        # fixed-beam setup which relies on gating.
-        if device is not None and not args.beam_no_route:
-            from .beam_router import (CAT_ASR_OUTPUT, BeamRouter,
-                                      FixedBeamController)
-
-            beam_router = BeamRouter(device)
-            beam_steer = FixedBeamController(device)
-            for slot, beam in (("L", 0), ("R", 1)):
-                res = beam_router.route_slot(slot, CAT_ASR_OUTPUT, beam)
-                print(f"[lane] route OP_{slot} -> (7,{beam})={'ok' if res.get('ok') else res}")
-                if not res.get("ok"):
-                    beam_router.restore()
-                    return 1
-            res = beam_steer.steer(args.beam_lanes[0], args.beam_lanes[1],
-                                   gating=False)
-            print(f"[lane] steer {args.beam_lanes} gating=off -> "
-                  f"{'ok' if res.get('ok') else res}")
-            if not res.get("ok"):
-                beam_steer.restore()
-                beam_router.restore()
-                return 1
-        elif args.beam_no_route:
-            print("[lane] --beam-no-route: leaving routing and beam angles "
-                  "untouched (capture only)")
-
-    _lane_route_owner = (beam_router, beam_steer)
+    audio_queue: queue.Queue = queue.Queue()
 
     def audio_callback(indata, frames, time_info, status):
-        """Fan one capture block out to every lane's own queue.
-
-        One stream, one block, N lanes: opening a stream per lane would put
-        two PortAudio clients on the same USB device, which crashes it, and
-        would also give the lanes independent clocks. Slicing here keeps them
-        on the same clock by construction.
-        """
         if status:
             pass  # overflow flags are tolerated; queue drops are the backpressure
-        for ln in lanes:
-            ln.queue.put(indata[:, ln.channel].copy())
+        audio_queue.put(indata[:, ch_index].copy())
 
-    def gate_verdict(ln: Lane, sw_prob: float) -> bool:
-        """Gate verdict for one lane.
+    def gate_verdict(sw_prob: float) -> bool:
+        """Hardware speech flag AND software VAD.
 
-        `energy` is the per-lane mode: the beam that faces a talker hears more
-        than the one facing away, which is the only per-lane signal available,
-        so the verdict is that beam's energy AND the software VAD - the same
-        and-semantics the project already uses, with a lane-specific first
-        operand instead of the device-wide hardware flag.
+        Both operands are needed rather than either alone: the firmware flag is
+        an energy gate that opens on any loud sound, while Silero is a model
+        that can be talked into a false positive by steady noise. Requiring
+        both keeps a doorbell out of the segmenter, and the segmenter's own
+        ratio filter then re-checks the same probability at flush time.
         """
-        if args.vad_gate == "hw":
-            return ln.hw_vad == 1
-        if args.vad_gate == "and":
-            return ln.hw_vad == 1 and sw_prob >= SW_FRAME_THRESHOLD
-        if args.vad_gate == "energy":
-            return (ln.energy_active(time.time(), args.silence_hold)
-                    and sw_prob >= SW_FRAME_THRESHOLD)
-        # confirm: hw opens the door, software decides entry/exit
-        if ln.confirm_pending:
-            if sw_prob >= SW_FRAME_THRESHOLD:
-                ln.confirm_sw_reject = 0
-                return True
-            ln.confirm_sw_reject += 1
-            if ln.confirm_sw_reject >= 5:
-                ln.confirm_pending = False
-                ln.confirm_sw_reject = 0
-                return False
-            return True
-        if ln.hw_vad == 1:
-            ln.confirm_pending = True
-            ln.confirm_sw_reject = 0
-            return sw_prob >= SW_FRAME_THRESHOLD
-        return False
+        return hw_vad == 1 and sw_prob >= SW_FRAME_THRESHOLD
 
-    def apply_actions(ln: Lane, actions):
+    def apply_actions(actions):
         """Translate Segmenter Actions into calls on the rest of the system.
 
-        Takes the lane rather than closing over a single segmenter, because
-        every side effect here is per lane: the DOA tally to reset, the stream
-        to open, the anchors to record. The broadcast carries the lane too so
-        the frontend can badge the card.
+        The segmenter is pure logic and returns data; every side effect lives
+        here, in the order the inline loop used to print them.
         """
-        seg = ln.segmenter
         for act in actions:
             # diagnostics first, in the order the inline loop printed them
             if act.flush_line:
@@ -852,16 +484,15 @@ def main(argv=None) -> int:
                 seg_open_at[act.seg_id] = time.monotonic()
                 # start a fresh DOA tally: the reported direction must
                 # describe this utterance; flush reads it back via locator.mode()
-                ln.locator.reset()
+                locator.reset()
                 seg_seed_secs[act.seg_id] = act.seed_secs
-                if args.streaming and provider.supports_streaming:
-                    transcriber.stream_start(act.seg_id)
-                    transcriber.stream_feed(
-                        act.seg_id,
-                        act.audio if act.audio is not None and act.audio.size
-                        else np.zeros(0, np.float32),
-                        act.seg_id)
-                    seg.mark_stream_open()
+                transcriber.stream_start(act.seg_id)
+                transcriber.stream_feed(
+                    act.seg_id,
+                    act.audio if act.audio is not None and act.audio.size
+                    else np.zeros(0, np.float32),
+                    act.seg_id)
+                segmenter.mark_stream_open()
                 print(f"[seg] open {act.seg_id} (seed {act.seed_secs:.2f}s)")
             elif act.kind == "feed":
                 transcriber.stream_feed(act.seg_id, act.audio, act.seg_id)
@@ -870,8 +501,7 @@ def main(argv=None) -> int:
                     transcriber.stream_abort(act.seg_id)
                 if act.seg_id:
                     server.broadcast({"type": "discard", "id": act.seg_id,
-                                      "ts": time.time(), "lane": ln.index,
-                                      "lane_label": ln.label})
+                                      "ts": time.time()})
                     seg_open_at.pop(act.seg_id, None)
                     seg_seed_secs.pop(act.seg_id, None)
                     first_char_logged.discard(act.seg_id)
@@ -879,11 +509,10 @@ def main(argv=None) -> int:
                 seg_id = act.seg_id
                 if act.stream_opened:
                     transcriber.stream_finish(seg_id, task_id=seg_id,
-                                              doa=ln.locator.mode(),
-                                              lane=ln.index)
+                                              doa=locator.mode())
                 else:
                     transcriber.submit(act.audio, task_id=seg_id,
-                                       doa=ln.locator.mode(), lane=ln.index)
+                                       doa=locator.mode())
                 # Timing anchors are only meaningful for segments that
                 # actually reach ASR. A rejected segment already aborted its
                 # stream and told the frontend to drop the card, so recording
@@ -905,14 +534,10 @@ def main(argv=None) -> int:
             device=input_device, channels=in_channels,
             samplerate=SAMPLE_RATE, dtype="float32", callback=audio_callback,
         ):
-            # A dual-lane run changes the device configuration, so it must put
-            # it back on every way out - not just Ctrl+C. `timeout` (and any
-            # supervisor) sends SIGTERM, which as a plain exception would skip
-            # the finally block entirely and leave the unit routed to two beams
-            # that nobody chose. Verified the hard way: a killed run left
-            # OP_ALL at [7,0,...,7,1,...] with SONOFF=1 and bearing [180,0].
-            # Converting the signal into KeyboardInterrupt routes it through the
-            # same cleanup path.
+            # `timeout` (and any supervisor) sends SIGTERM, which as a plain
+            # exception would skip the finally block entirely and leave the
+            # websocket port bound. Converting the signal into
+            # KeyboardInterrupt routes it through the same cleanup path.
             import signal
 
             def _on_term(_signum, _frame):
@@ -928,9 +553,8 @@ def main(argv=None) -> int:
             while True:
                 now = time.time()
 
-                # 3) drain hw VAD / DOA / per-beam energy
+                # 3) drain hw VAD / DOA
                 hw_vad = 0
-                energy: list[float] = []
                 while True:
                     try:
                         snap = vad_reader.vad_queue.get_nowait() if vad_reader else None
@@ -939,51 +563,33 @@ def main(argv=None) -> int:
                     if snap is None:
                         continue
                     hw_vad = snap["hw_vad"]
-                    if snap.get("energy"):
-                        energy = snap["energy"]
                     if snap["doa"] is not None:
                         doa_last = snap["doa"]
-                        if lanes[0].segmenter.active:
+                        if segmenter.active:
                             locator.observe(doa_last)
 
-                # The control plane is device-wide, so its reading is fanned
-                # out to every lane; only the interpretation differs, and that
-                # lives in gate_verdict.
-                for ln in lanes:
-                    ln.hw_vad = hw_vad
-                    ln.energy = energy
+                # 4) feed the segmenter and act on the Actions it returns.
+                # The loop stays single-threaded on purpose: segmentation
+                # driven from another thread would race on the shared
+                # telemetry and lose the 100 ms tick semantics that the
+                # timing numbers depend on.
+                chunks = []
+                while True:
+                    try:
+                        chunks.append(audio_queue.get_nowait())
+                    except queue.Empty:
+                        break
+                speaking = segmenter.active
+                actions = segmenter.feed(chunks, gate_verdict, hw_vad, now)
+                sw_prob = segmenter.last_prob
+                gate = segmenter.last_gate
 
-                # 4) one segmenter per lane, each returning the Actions that
-                # lane owes the rest of the system this tick. The loop stays
-                # single-threaded on purpose: two segmenters driven from two
-                # threads would race on the shared telemetry and lose the
-                # 100 ms tick semantics that the timing numbers depend on.
-                for ln in lanes:
-                    seg = ln.segmenter
-                    chunks = []
-                    while True:
-                        try:
-                            chunks.append(ln.queue.get_nowait())
-                        except queue.Empty:
-                            break
-                    speaking = seg.active
-                    actions = seg.feed(chunks, lambda p, l=ln: gate_verdict(l, p),
-                                       ln.hw_vad, now)
-                    sw_prob = seg.last_prob
-                    gate = seg.last_gate
+                if args.debug_gate and (hw_vad or sw_prob >= 0.05 or speaking):
+                    print(f"[gate] hw={hw_vad} sw={sw_prob:.3f} gate={gate} "
+                          f"state={'SPK' if speaking else 'IDLE'} "
+                          f"doa={doa_last}")
 
-                    if args.debug_gate and (ln.hw_vad or sw_prob >= 0.05 or speaking):
-                        print(f"{ln.tag}[gate] hw={ln.hw_vad} sw={sw_prob:.3f} "
-                              f"gate={gate} "
-                              f"state={'SPK' if speaking else 'IDLE'} "
-                              f"doa={doa_last}")
-
-                    apply_actions(ln, actions)
-
-                # the heartbeat and the idle-path debug line describe lane 0 in
-                # single-lane mode; with more lanes each one contributes
-                speaking = lanes[0].segmenter.active
-                sw_prob = lanes[0].segmenter.last_prob
+                apply_actions(actions)
 
                 # 5) frontend commands
                 while True:
@@ -1038,8 +644,6 @@ def main(argv=None) -> int:
                     # the card label and the translation direction are both
                     # derived from the recognized text instead.
                     lang = detect_language(result.text)
-                    lane_idx = int(result.meta.get("lane", 0))
-                    lane_obj = lanes[lane_idx] if lane_idx < len(lanes) else lanes[0]
                     server.broadcast({
                         "type": "final" if is_final else "source",
                         "id": task_id,
@@ -1047,28 +651,16 @@ def main(argv=None) -> int:
                         "doa": result.meta.get("doa", ""),
                         "text": result.text,
                         "lang": lang,
-                        "lane": lane_idx,
-                        "lane_label": lane_obj.label,
                     })
                     translation.submit(task_id, result.text, lang)
 
-                # heartbeat broadcast. The per-lane form is additive: the
-                # top-level hw_vad/sw_prob/segment_state stay exactly as they
-                # were so a single-lane frontend sees no change, and `lanes`
-                # only carries data once there is more than one.
+                # heartbeat broadcast
                 server.broadcast({
                     "type": "vad.state",
                     "hw_vad": hw_vad,
                     "sw_prob": round(sw_prob, 3),
-                    "gate_mode": args.vad_gate,
+                    "gate_mode": "and",
                     "segment_state": "SPEAKING" if speaking else "IDLE",
-                    "lanes": [
-                        {"lane": ln.index, "label": ln.label,
-                         "active": ln.segmenter.active,
-                         "energy": int(max(ln.energy[ln.beam_index],
-                                           ln.energy[0]) if ln.energy else 0)}
-                        for ln in lanes
-                    ] if len(lanes) > 1 else [],
                 })
 
                 elapsed = time.time() - now
@@ -1087,25 +679,10 @@ def main(argv=None) -> int:
             print(f"[首字] 汇总: {fn} 句有 partial, 均值 {fsum / fn:.2f}s"
                   + (f", 另 {fmiss} 句太短无 partial" if fmiss else ""))
         with first_char_lock:
-            for ln in lanes:
-                if ln.segmenter.counters.flushed or ln.segmenter.counters.discarded:
-                    print(f"[seg] {ln.segmenter.summary()}")
+            if segmenter.counters.flushed or segmenter.counters.discarded:
+                print(f"[seg] {segmenter.summary()}")
         if vad_reader:
             vad_reader.stop()
-        # put the beam configuration back if we were holding a steering change
-        if beam_controller is not None:
-            print(f"[beam] restoring original beam config: "
-                  f"{beam_controller.restore()}")
-        # dual-lane runs changed both the steering and the output routing, and
-        # both have to go back: leaving the routing behind would have the unit
-        # boot into a state nobody chose
-        if _lane_route_owner[0] is not None:
-            print(f"[lane] restoring output routing: "
-                  f"{_lane_route_owner[0].restore()} "
-                  f"-> {_lane_route_owner[0].recon()['op_all']}")
-        if _lane_route_owner[1] is not None:
-            print(f"[lane] restoring beam steering: "
-                  f"{_lane_route_owner[1].restore()}")
         transcriber.stop()
         final_decode.stop()
         translation.stop()

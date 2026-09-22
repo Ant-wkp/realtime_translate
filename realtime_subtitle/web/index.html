@@ -45,19 +45,15 @@ header h1{font-size:1rem;font-weight:600;letter-spacing:.02em}
   box-shadow:0 0 10px transparent}
 #dot.on{background:var(--ok);box-shadow:0 0 12px var(--ok);animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
-/* Voice-activity meter. One group of four bars per lane: in single-lane mode
-   there is exactly one group, so the header looks and measures the same as it
-   always did, and the gap only appears once a second lane exists. */
-#gate{display:flex;align-items:flex-end;gap:.55rem;height:16px;opacity:.3;
+/* Voice-activity meter: four bars driven by the hardware speech flag. */
+#gate{display:flex;align-items:flex-end;gap:2.5px;height:16px;opacity:.3;
   transition:opacity .35s ease;min-width:2.4em}
-#gate .g{display:flex;align-items:flex-end;gap:2.5px;height:16px}
-#gate .g i{width:3px;height:5px;border-radius:2px;background:var(--text-dim);
+#gate i{width:3px;height:5px;border-radius:2px;background:var(--text-dim);
   transition:background .35s ease}
-#gate.on .g i{background:var(--accent);animation:eq .9s ease-in-out infinite}
-#gate.on .g i:nth-child(2){animation-delay:.13s}
-#gate.on .g i:nth-child(3){animation-delay:.26s}
-#gate.on .g i:nth-child(4){animation-delay:.39s}
-#gate.on .g[data-lane="1"] i{background:var(--accent-2)}
+#gate.on i{background:var(--accent);animation:eq .9s ease-in-out infinite}
+#gate.on i:nth-child(2){animation-delay:.13s}
+#gate.on i:nth-child(3){animation-delay:.26s}
+#gate.on i:nth-child(4){animation-delay:.39s}
 @keyframes eq{0%,100%{height:5px}50%{height:15px}}
 #gear{width:36px;height:36px;border:1px solid var(--border);border-radius:10px;
   background:var(--glass);color:var(--text);cursor:pointer;display:grid;place-items:center;
@@ -108,12 +104,6 @@ main{max-width:860px;margin:0 auto;padding:1.1rem 1rem 6rem;display:flex;
   background:rgba(76,201,240,.10);border:1px solid rgba(76,201,240,.28);
   white-space:nowrap}
 .pill.src{color:#fbbf24;background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.25)}
-/* Lane badge. Distinct hue per lane so a mixed stream can be read without
-   following the text; single-lane runs never show it (see stampLane). */
-.pill.lane{color:var(--accent);background:rgba(76,201,240,.1);
-  border-color:rgba(76,201,240,.3);font-weight:600}
-.pill.lane[data-lane="1"]{color:var(--accent-2);background:rgba(123,108,246,.12);
-  border-color:rgba(123,108,246,.34)}
 /* per-sentence speaker direction, filled in when the segment closes */
 .pill.doa{color:#34d399;background:rgba(52,211,153,.09);
   border-color:rgba(52,211,153,.28);display:inline-flex;align-items:center;
@@ -240,7 +230,7 @@ select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--
   <div class="logo"></div>
   <h1>reSpeaker 实时双语字幕</h1>
   <div class="spacer"></div>
-  <div id="gate" title="语音活动"><div class="g" data-lane="0"><i></i><i></i><i></i><i></i></div></div>
+  <div id="gate" title="语音活动"><i></i><i></i><i></i><i></i></div>
   <div id="dot" title="连接状态"></div>
   <button id="gear" title="设置">
     <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/>
@@ -326,7 +316,6 @@ function cardFor(id, partial){
     el.innerHTML =
       '<div class="meta">' +
         '<span class="pill src">partial</span>' +
-        '<span class="pill lane" hidden></span>' +
         '<span class="pill doa" hidden></span>' +
       '</div>' +
       '<div class="src-text"></div>' +
@@ -341,37 +330,6 @@ function cardFor(id, partial){
     }
   }
   return el;
-}
-
-function stampLane(el, msg){
-  // The label is looked up by the backend from its zone table, so the frontend
-  // never guesses which speaker a card belongs to. Nothing is shown when there
-  // is only one lane - a lone "lane 0" badge on every card would be noise, and
-  // single-lane runs are meant to look exactly as they did before lanes
-  // existed.
-  const p = el.querySelector(".pill.lane");
-  if (!p) return;
-  if (msg.lane_label === undefined || msg.lane_label === null ||
-      msg.lane_label === ""){
-    p.hidden = true;
-    return;
-  }
-  p.textContent = msg.lane_label;
-  p.dataset.lane = String(msg.lane ?? 0);
-  p.title = "声道：" + msg.lane_label;
-  p.hidden = false;
-}
-
-// Rebuild the meter groups only when the lane set actually changed, so the CSS
-// bar animation is not restarted (and the bars do not flicker) on every
-// 100 ms tick.
-function syncGateGroups(g, lanes){
-  const want = lanes.map(l => String(l.lane)).join(",");
-  if (g.dataset.lanes === want) return;
-  g.dataset.lanes = want;
-  g.innerHTML = lanes.map(l =>
-    '<div class="g" data-lane="' + esc(String(l.lane)) + '">' +
-    "<i></i><i></i><i></i><i></i></div>").join("");
 }
 
 function stampDoa(el, doa){
@@ -405,7 +363,6 @@ function handle(msg){
       removeEmpty();
       const el = cardFor(msg.id);
       freezeCard(el, msg.lang);
-      stampLane(el, msg);
       stampDoa(el, msg.doa);
       el.querySelector(".src-text").textContent = msg.text || "";
       scrollIfStuck();
@@ -415,7 +372,6 @@ function handle(msg){
       removeEmpty();
       const el = cardFor(msg.id);
       freezeCard(el, msg.lang);
-      stampLane(el, msg);
       stampDoa(el, msg.doa);
       el.querySelector(".src-text").textContent = msg.text || "";
       scrollIfStuck();
@@ -428,7 +384,6 @@ function handle(msg){
       // replaces the whole line - there is no append and no reveal
       // animation, the card simply grows by one decode step.
       const el = cardFor(msg.id, true);
-      stampLane(el, msg);
       el.querySelector(".src-text").textContent = msg.text || "";
       scrollIfStuck();
       break;
@@ -453,31 +408,11 @@ function handle(msg){
     case "vad.state": {
       // a small level meter instead of the "and · 静" text: silence shows a
       // dim resting bar, speech lifts the bars and tints them.
-      // With two lanes there is one meter group per lane, so which voice is
-      // live is visible without reading the captions. Single-lane runs send
-      // no `lanes`, and fall back to exactly the previous behaviour: one
-      // group, driven by the top-level hw_vad/segment_state.
       const g = $("gate");
-      const lanes = Array.isArray(msg.lanes) ? msg.lanes : null;
-      if (lanes && lanes.length){
-        syncGateGroups(g, lanes);
-        const anyOn = lanes.some(l => l.active);
-        g.classList.toggle("on", anyOn);
-        g.title = "语音活动：" + (anyOn ? "说话中" : "静音") +
-          "（门控 " + (msg.gate_mode || "?") + "）\n" +
-          lanes.map(l => (l.label || ("声道" + (l.lane + 1))) + "：" +
-            (l.active ? "说话" : "静") +
-            (l.energy === undefined ? "" : " 能量 " + l.energy)).join("\n");
-      } else {
-        // Fallback: the single-lane message shape. Normalise the meter back to
-        // one group, so a page that has seen a two-lane state (or a stale
-        // dataset) cannot be left showing two groups driven by one signal.
-        syncGateGroups(g, [{lane: 0}]);
-        const active = msg.segment_state === "SPEAKING" || !!msg.hw_vad;
-        g.classList.toggle("on", active);
-        g.title = "语音活动：" + (active ? "说话中" : "静音") +
-          "（门控 " + (msg.gate_mode || "?") + "）";
-      }
+      const active = msg.segment_state === "SPEAKING" || !!msg.hw_vad;
+      g.classList.toggle("on", active);
+      g.title = "语音活动：" + (active ? "说话中" : "静音") +
+        "（门控 " + (msg.gate_mode || "?") + "）";
       break;
     }
     case "cmd_result":

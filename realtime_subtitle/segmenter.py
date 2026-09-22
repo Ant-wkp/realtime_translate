@@ -1,4 +1,4 @@
-"""Segmenter: one lane's audio-to-segment state machine, as pure logic.
+"""Segmenter: audio-to-segment state machine, as pure logic.
 
 This is the segmentation half of what used to be inline in main(): the
 per-tick gating decision, the pre-roll ring buffer, the trailing-silence hold
@@ -6,12 +6,7 @@ and the three flush-time filters. It is deliberately free of I/O - the
 caller feeds it audio and a gate verdict, and gets back a list of Actions to
 perform. That keeps the transcription queue, the broadcast server and the
 device control plane out of here, which is what makes the logic testable
-without hardware and, more importantly, runnable once per lane.
-
-One instance per lane. Nothing here is shared: the state below, the audio it
-buffers and the software VAD it frames with all belong to a single lane, and
-that is deliberate - a shared instance would interleave two speakers'
-utterances into one segment.
+without hardware.
 """
 
 from __future__ import annotations
@@ -65,7 +60,7 @@ class Action:
 
 @dataclass
 class Counters:
-    """Per-lane rolling statistics, printed on exit."""
+    """Rolling statistics, printed on exit."""
 
     flushed: int = 0
     discarded: int = 0
@@ -94,25 +89,17 @@ def trim_tail(audio: np.ndarray, floor_energy: float) -> np.ndarray:
 
 
 class Segmenter:
-    """One lane's segmentation state machine.
+    """The segmentation state machine.
 
     Call `feed()` once per main-loop tick with that tick's audio and the gate
-    verdict for this lane, then act on the returned Actions. The sequence
-    inside `feed()` mirrors the original inline loop exactly, so a single-lane
-    run behaves the same as before the extraction.
+    verdict, then act on the returned Actions. The sequence inside `feed()`
+    mirrors the original inline loop exactly, so behaviour is unchanged from
+    before the extraction.
     """
 
-    def __init__(self, cfg: SegmentCfg, vad: SoftwareVad,
-                 lane: int = 0, azimuth: float = 0.0, label: str = "",
-                 tag: str = ""):
+    def __init__(self, cfg: SegmentCfg, vad: SoftwareVad):
         self.cfg = cfg
         self.vad = vad
-        self.lane = lane
-        self.azimuth = azimuth
-        self.label = label
-        # Log prefix for dual-lane runs ("lane0(左) "). Empty in single-lane
-        # mode so every existing diagnostic line stays byte-identical.
-        self.tag = tag
         self.counters = Counters()
         # most recent VAD readings, for the caller's gate debug and heartbeat
         self.last_prob = 0.0
@@ -299,13 +286,13 @@ class Segmenter:
             avg = voiced_prob / voiced_span if voiced_span else 0.0
             exempt = (duration < self.cfg.short_exempt_seconds
                       and self.max_prob >= self.cfg.short_exempt_max_prob)
-            debug = (f"{self.tag}[flush] dur={duration:.2f}s "
+            debug = (f"[flush] dur={duration:.2f}s "
                      f"ratio={ratio:.2f} avg_prob={avg:.2f} "
                      f"max_prob={self.max_prob:.2f} exempt={exempt} "
                      f"hw_ticks={self.hw_speech_ticks}")
         # printed unconditionally, and printed before the [flush] stats line:
         # both ordering and wording match the original inline loop
-        flush_line = (f"{self.tag}[seg] flush after {now - self.seg_start:.2f}s "
+        flush_line = (f"[seg] flush after {now - self.seg_start:.2f}s "
                       f"(tail wait {silence:.2f}s)")
 
         # level 1: duration
@@ -359,7 +346,7 @@ class Segmenter:
             ratio = self.sw_speech_frames / denom if denom else 0.0
             avg = ((self.prob_sum - self.silent_tail_prob) / denom
                    if denom else 0.0)
-            extra = (f"{self.tag}[VAD] discard {action.seg_id} ({reason}): "
+            extra = (f"[VAD] discard {action.seg_id} ({reason}): "
                      f"dur={self.voiced_seconds():.2f}s ratio={ratio:.2f} "
                      f"avg_prob={avg:.2f} max_prob={self.max_prob:.2f} "
                      f"hw_ticks={self.hw_speech_ticks}/{denom // 512 or 1}")
@@ -401,7 +388,6 @@ class Segmenter:
         for r in self.counters.discard_reasons:
             reasons[r] = reasons.get(r, 0) + 1
         tail = ", ".join(f"{k}×{v}" for k, v in sorted(reasons.items()))
-        name = f"lane{self.lane}" + (f"({self.label})" if self.label else "")
-        return (f"{name}: 交付 {self.counters.flushed}, "
+        return (f"交付 {self.counters.flushed}, "
                 f"丢弃 {self.counters.discarded}"
                 + (f" [{tail}]" if tail else ""))
