@@ -160,10 +160,14 @@ select,input[type=text],input[type=number]{
   transition:border-color .2s, background .2s;
 }
 /* The closed select takes the translucent glass background above, but the open
-   popup replaces it with the UA's own surface. Name both colours so the list
-   stays on-theme on platforms that do not honour color-scheme for options. */
+   popup replaces it with the UA's own surface. The selected row also gets the
+   UA's highlight, so this rule only has to keep the text legible: the colour
+   must be opaque, because a translucent one composites over whatever surface
+   the popup happens to have - which is how the highlight ended up unreadable
+   (pale cyan over a light popup, under near-white text). Opaque dark wins on
+   both a light and a dark surface. */
 select option{background:var(--bg);color:var(--text)}
-select option:checked{background:rgba(76,201,240,.22);color:var(--text)}
+select option:checked{background:var(--bg);color:var(--accent)}
 select:hover,input[type=text]:hover,input[type=number]:hover{border-color:rgba(255,255,255,.28)}
 select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--accent)}
 .btn{padding:.55rem 1rem;border:none;border-radius:9px;cursor:pointer;font-size:.83rem;
