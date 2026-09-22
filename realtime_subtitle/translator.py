@@ -22,6 +22,23 @@ from .asr import detect_language
 
 log = logging.getLogger(__name__)
 
+# NLLB-200 knows 200 languages, not 13: the full set is the
+# `additional_special_tokens` array in the model's special_tokens_map.json, and
+# every code below is a member of it. This table is the *commonly used* subset
+# for two reasons -
+#
+#   1. it is what the settings dropdown offers, and a 200-entry list is not a
+#      usable control;
+#   2. only these four have a source side. detect_language() classifies by
+#      script and can only return ja / ko / zh / en, so the source tokens for
+#      fr, de, es and the rest are currently unreachable - a sentence in those
+#      languages is read as "en". They are listed anyway because the target
+#      side is reachable and because swapping in a real language-ID model (or a
+#      multilingual ASR) only requires the source side to start producing these
+#      codes.
+#
+# Adding a language is a one-line change here: it flows to the dropdown via
+# control.cmd_get_target_langs, which publishes this dict verbatim.
 LANG_TO_NLLB = {
     "zh": "zho_Hans",
     "en": "eng_Latn",

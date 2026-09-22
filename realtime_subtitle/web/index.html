@@ -14,13 +14,21 @@
   --accent: #4cc9f0;
   --accent-2: #7b6cf6;
   --ok: #34d399; --err: #f87171; --info: #60a5fa;
+  --bg: #0a0f1e;
+  /* The page paints its own dark background, but form controls are drawn by
+     the UA, not by us: without this the <select> dropdown opened as a white
+     panel with near-white text, i.e. unreadable. Declaring the scheme here
+     puts every control (including the option list, which is rendered outside
+     the drawer and cannot be reached by ordinary selectors) into the dark
+     branch. */
+  color-scheme: dark;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
 body{
   font-family:"Segoe UI",system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
   color:var(--text);
-  background:#0a0f1e;
+  background:var(--bg);
   background-image:
     radial-gradient(60rem 40rem at 15% 10%, rgba(76,201,240,.14), transparent 60%),
     radial-gradient(50rem 36rem at 85% 45%, rgba(123,108,246,.12), transparent 60%),
@@ -145,12 +153,17 @@ main{max-width:860px;margin:0 auto;padding:1.1rem 1rem 6rem;display:flex;
    a settings list instead of a stack of full-width controls */
 .field{display:flex;align-items:center;gap:.6rem;margin-bottom:.5rem}
 .field label{flex:0 0 5.4em;font-size:.74rem;color:var(--text-dim)}
-.field select{margin:0;flex:1}
+.field select{margin:0;flex:1;color-scheme:dark}
 select,input[type=text],input[type=number]{
   width:100%;padding:.5rem .6rem;margin-bottom:.55rem;border-radius:9px;color:var(--text);
   background:rgba(255,255,255,.05);border:1px solid var(--border);outline:none;font-size:.85rem;
   transition:border-color .2s, background .2s;
 }
+/* The closed select takes the translucent glass background above, but the open
+   popup replaces it with the UA's own surface. Name both colours so the list
+   stays on-theme on platforms that do not honour color-scheme for options. */
+select option{background:var(--bg);color:var(--text)}
+select option:checked{background:rgba(76,201,240,.22);color:var(--text)}
 select:hover,input[type=text]:hover,input[type=number]:hover{border-color:rgba(255,255,255,.28)}
 select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--accent)}
 .btn{padding:.55rem 1rem;border:none;border-radius:9px;cursor:pointer;font-size:.83rem;
