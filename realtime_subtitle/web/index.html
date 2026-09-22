@@ -33,10 +33,16 @@ body{
     radial-gradient(60rem 40rem at 15% 10%, rgba(76,201,240,.14), transparent 60%),
     radial-gradient(50rem 36rem at 85% 45%, rgba(123,108,246,.12), transparent 60%),
     radial-gradient(46rem 30rem at 50% 100%, rgba(251,146,60,.07), transparent 65%);
-  overflow-x:hidden;
+  /* the header and the subtitle list are the only two children, and the list
+     is the one that scrolls - so the page itself must never scroll, or the
+     newest card would be chased through two scroll ports at once */
+  display:flex;flex-direction:column;overflow:hidden;
 }
+/* The page no longer scrolls (the list does), so "sticky" would stick to a
+   scrollport that never moves - relative keeps the stacking order without
+   implying otherwise. */
 header{
-  position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:.7rem;
+  position:relative;z-index:5;display:flex;align-items:center;gap:.7rem;
   padding:.8rem 1.1rem;
   background:rgba(13,18,33,.55);
   backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
@@ -68,8 +74,13 @@ header h1{font-size:1rem;font-weight:600;letter-spacing:.02em}
   transition:transform .35s ease, background .2s}
 #gear:hover{transform:rotate(45deg);background:var(--glass-strong)}
 #gear svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6}
-main{max-width:860px;margin:0 auto;padding:1.1rem 1rem 6rem;display:flex;
-  flex-direction:column;gap:.8rem}
+/* The subtitle list is its own scroll container rather than the page: the
+   newest card is then anchored to the real bottom of the viewport, and there
+   is only one scrollable to measure. The bottom padding is clearance for the
+   toast, which floats over this box. */
+main{max-width:860px;margin:0 auto;width:100%;flex:1;min-height:0;
+  overflow-y:auto;overscroll-behavior:contain;
+  padding:1.1rem 1rem 4.5rem;display:flex;flex-direction:column;gap:.8rem}
 #empty{display:flex;flex-direction:column;align-items:center;gap:1.35rem;
   padding:6rem 0;color:var(--text-dim)}
 /* breathing wait ring: a single hollow ring that inhales and exhales, with
@@ -229,15 +240,23 @@ select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--
 .mini:hover{background:rgba(255,255,255,.2)}
 .mini.icon{width:24px;padding:.28rem 0;display:grid;place-items:center;font-size:.8rem;
   line-height:1}
-#toast{position:fixed;left:50%;bottom:2rem;transform:translate(-50%,150%);
+/* Fully invisible at rest, not merely translated out of the way. The old rule
+   offset the box by 150% of its own height, which is short of the 2rem gap it
+   also had to clear - so a rounded sliver stayed on screen at bottom centre,
+   reading as an unexplained ellipse. visibility + opacity makes "hidden"
+   independent of that arithmetic. It floats above the list's bottom padding
+   rather than over the newest card. */
+#toast{position:fixed;left:50%;bottom:1.25rem;transform:translate(-50%,1rem);
   z-index:12;max-width:78vw;padding:.6rem 1.1rem;border-radius:10px;font-size:.82rem;
   background:rgba(15,20,36,.95);border:1px solid var(--border);color:var(--text);
-  transition:transform .3s ease;backdrop-filter:blur(10px)}
-#toast.show{transform:translate(-50%,0)}
+  opacity:0;visibility:hidden;pointer-events:none;
+  transition:opacity .25s ease, transform .25s ease, visibility .25s;
+  backdrop-filter:blur(10px)}
+#toast.show{opacity:1;visibility:visible;transform:translate(-50%,0)}
 #toast.ok{border-color:rgba(52,211,153,.5)} #toast.err{border-color:rgba(248,113,113,.5)}
 #toast.info{border-color:rgba(96,165,250,.5)}
 @media(max-width:520px){
-  main{padding:.9rem .8rem 5rem}
+  main{padding:.9rem .8rem 4.5rem}
   #drawer{width:94vw}
 }
 </style>
@@ -313,10 +332,20 @@ function toast(msg, kind){
   t._timer = setTimeout(() => t.className = "", 2600);
 }
 function nearBottom(){
-  return window.innerHeight + window.scrollY >= document.body.scrollHeight - 80;
+  // measured on the list element, not on the document: the list is what
+  // scrolls, and this stays correct whichever element a browser picks as the
+  // scrolling one.
+  return stream.scrollHeight - stream.scrollTop - stream.clientHeight <= 80;
 }
 function scrollIfStuck(){
-  if (nearBottom()) window.scrollTo({top: document.body.scrollHeight, behavior:"smooth"});
+  // Someone who scrolled back up to re-read must not be yanked down by the
+  // next partial, so only follow when already at the end.
+  if (!nearBottom()) return;
+  const gap = stream.scrollHeight - stream.scrollTop - stream.clientHeight;
+  // A smooth scroll restarted on every partial (~480ms apart) never finishes
+  // its animation and reads as jitter; short distances are jumped instead.
+  stream.scrollTo({top: stream.scrollHeight,
+                   behavior: gap > 24 ? "smooth" : "auto"});
 }
 function removeEmpty(){
   if (empty && empty.parentNode) empty.remove();
