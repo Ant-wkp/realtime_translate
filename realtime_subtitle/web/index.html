@@ -78,11 +78,30 @@ header h1{font-size:1rem;font-weight:600;letter-spacing:.02em}
    newest card is then anchored to the real bottom of the viewport, and there
    is only one scrollable to measure. The bottom padding is clearance for the
    toast, which floats over this box. */
-main{max-width:860px;margin:0 auto;width:100%;flex:1;min-height:0;
+/* The dialogue column is deliberately wide: with a narrow centred column the
+   two sides sit far from the window edges and the left/right split reads as
+   "centred text" rather than as two parties. The bubbles cap their own text
+   width instead, so widening this box buys side clearance without producing
+   over-long lines. */
+main{max-width:1500px;margin:0 auto;width:100%;flex:1;min-height:0;
   overflow-y:auto;overscroll-behavior:contain;
-  padding:1.1rem 1rem 4.5rem;display:flex;flex-direction:column;gap:.8rem}
+  padding:1.1rem clamp(1rem,3vw,3rem) 4.5rem;
+  display:flex;flex-direction:column;gap:.75rem}
+/* Who speaks on which side. Sticky so the mapping stays put while the
+   dialogue scrolls underneath it. */
+#legend{position:sticky;top:0;z-index:3;display:flex;justify-content:space-between;
+  gap:.4rem;font-size:.68rem;margin-bottom:.1rem}
+#legend span{display:inline-flex;align-items:center;gap:.35em;max-width:min(48%,30rem);
+  padding:.2rem .6rem;border-radius:99px;border:1px solid var(--border);
+  background:rgba(10,15,30,.74);backdrop-filter:blur(8px);
+  -webkit-backdrop-filter:blur(8px);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
+#legend .lgh{width:6px;height:6px;border-radius:50%;background:currentColor;
+  flex:0 0 auto}
+#legend .left{color:#c4b5fd}
+#legend .right{color:var(--accent)}
 #empty{display:flex;flex-direction:column;align-items:center;gap:1.35rem;
-  padding:6rem 0;color:var(--text-dim)}
+  padding:4rem 0;color:var(--text-dim)}
 /* breathing wait ring: a single hollow ring that inhales and exhales, with
    two ripple halos trailing behind. No rotation and no filled centre, so it
    reads as "listening" rather than "loading" */
@@ -108,21 +127,57 @@ main{max-width:860px;margin:0 auto;width:100%;flex:1;min-height:0;
   #empty .ring,#empty .ring::before,#empty .ring::after{
     animation-duration:6s}
 }
-.card{
-  position:relative;background:var(--glass);
+/* Conversation layout: every utterance is a chat turn aligned to the side of
+   the language it was spoken in - Chinese source on the right, any other
+   source on the left - so the list reads top to bottom as a dialogue. The
+   translation sits inside the same bubble, under a dashed rule, as the half
+   addressed to the other party. */
+.turn{position:relative;display:flex;align-items:flex-start;gap:.55rem;
+  animation:rise .35s ease both}
+/* row-reverse puts the badge outboard on the left side: the DOM order stays
+   [bubble, badge] for both sides, only the axis flips, so the avatar always
+   ends up on the far edge and the bubble always against it */
+.turn.right{justify-content:flex-end}
+.turn.left{flex-direction:row-reverse;justify-content:flex-end}
+/* Consecutive turns from one party read as a single burst: pulled together,
+   with the avatar shown only once at the top of it. */
+.turn.left.cont,.turn.right.cont{margin-top:-.35rem}
+/* Named .who rather than .badge: the drawer's "advanced" chip already owns
+   .badge, and sharing the name let its padding/border-radius leak onto every
+   speaker avatar. */
+.turn.cont .who{visibility:hidden}
+.who{flex:0 0 auto;width:28px;height:28px;border-radius:50%;display:grid;
+  place-items:center;font-size:.6rem;font-weight:600;letter-spacing:.02em;
+  font-family:ui-monospace,Consolas,monospace;margin-top:.15rem;
+  border:1px solid var(--border);background:rgba(255,255,255,.05);
+  color:var(--text-dim)}
+.turn.right .who{color:var(--accent);background:rgba(76,201,240,.11);
+  border-color:rgba(76,201,240,.35)}
+.turn.left .who{color:#c4b5fd;background:rgba(167,139,250,.12);
+  border-color:rgba(167,139,250,.35)}
+.bubble{position:relative;max-width:min(76%,44rem);min-width:5.5rem;
   backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
-  border:1px solid var(--border);border-radius:14px;padding:.9rem 1rem .95rem 1.2rem;
-  animation:rise .35s ease both;
-}
-@supports not (backdrop-filter:blur(1px)){.card{background:rgba(20,26,44,.85)}}
+  border:1px solid var(--border);border-radius:14px;padding:.7rem .9rem .75rem}
+@supports not (backdrop-filter:blur(1px)){.bubble{background:rgba(20,26,44,.85)}}
 @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-.card::before{content:"";position:absolute;left:0;top:14%;bottom:14%;width:3px;
-  border-radius:3px;background:linear-gradient(180deg,var(--accent),var(--accent-2))}
-.meta{display:flex;align-items:center;gap:.5rem;margin-bottom:.45rem;flex-wrap:wrap}
+/* The squared-off corner points back at the speaker's side, the way a chat
+   bubble tail would. */
+.turn.right .bubble{border-bottom-right-radius:4px;
+  border-color:rgba(76,201,240,.30);
+  background:linear-gradient(135deg,rgba(76,201,240,.15),rgba(76,201,240,.05))}
+.turn.left .bubble{border-bottom-left-radius:4px;
+  border-color:rgba(123,108,246,.32);
+  background:linear-gradient(135deg,rgba(123,108,246,.17),rgba(123,108,246,.06))}
+.meta{display:flex;align-items:center;gap:.5rem;margin-bottom:.4rem;flex-wrap:wrap}
 .pill{font-size:.68rem;padding:.14rem .55rem;border-radius:99px;color:var(--accent);
   background:rgba(76,201,240,.10);border:1px solid rgba(76,201,240,.28);
   white-space:nowrap}
-.pill.src{color:#fbbf24;background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.25)}
+.pill.src{color:var(--text-dim);background:rgba(255,255,255,.05);
+  border-color:var(--border)}
+.turn.right .pill.src{color:var(--accent);background:rgba(76,201,240,.12);
+  border-color:rgba(76,201,240,.32)}
+.turn.left .pill.src{color:#c4b5fd;background:rgba(167,139,250,.13);
+  border-color:rgba(167,139,250,.34)}
 /* per-sentence speaker direction, filled in when the segment closes */
 .pill.doa{color:#34d399;background:rgba(52,211,153,.09);
   border-color:rgba(52,211,153,.28);display:inline-flex;align-items:center;
@@ -130,8 +185,13 @@ main{max-width:860px;margin:0 auto;width:100%;flex:1;min-height:0;
 .pill.doa::before{content:"";width:5px;height:5px;border-radius:50%;
   background:currentColor;box-shadow:0 0 6px currentColor}
 .src-text{font-size:1.02rem;line-height:1.55}
-.trans{margin-top:.5rem;padding-top:.5rem;border-top:1px dashed var(--border);
-  font-size:.98rem;line-height:1.5;color:var(--accent)}
+/* the translated half is drawn as a nested block rather than a differently
+   coloured line: it then reads the same on the cyan and on the violet bubble.
+   No border - two nested outlines per turn was visual noise. */
+.trans{margin-top:.5rem;padding:.42rem .55rem;border-radius:9px;
+  font-size:.95rem;line-height:1.5;color:var(--text);
+  background:rgba(0,0,0,.20)}
+.trans:empty{display:none}
 .trans.pending{color:var(--text-dim);animation:shimmer 1.6s ease-in-out infinite}
 @keyframes shimmer{0%,100%{opacity:.55}50%{opacity:.95}}
 .cursor{display:inline-block;width:.55em;height:1.05em;margin-left:.15em;
@@ -141,8 +201,6 @@ main{max-width:860px;margin:0 auto;width:100%;flex:1;min-height:0;
 /* an explicit display on a class would otherwise beat the UA rule for the
    hidden attribute, leaving an empty pill's dot on screen */
 [hidden]{display:none !important}
-.trans .lang{font-size:.66rem;font-family:ui-monospace,Consolas,monospace;
-  color:var(--text-dim);margin-left:.4rem}
 /* drawer */
 #mask{position:fixed;inset:0;background:rgba(6,9,18,.45);backdrop-filter:blur(6px);
   -webkit-backdrop-filter:blur(6px);opacity:0;pointer-events:none;transition:opacity .3s;z-index:8}
@@ -257,6 +315,10 @@ select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--
 #toast.info{border-color:rgba(96,165,250,.5)}
 @media(max-width:520px){
   main{padding:.9rem .8rem 4.5rem}
+  /* at 80% the two sides nearly meet on a phone and the split stops reading
+     as two parties, so the bubbles give up width to the centre gutter */
+  .bubble{max-width:72%}
+  .who{width:24px;height:24px;font-size:.54rem}
   #drawer{width:94vw}
 }
 </style>
@@ -275,6 +337,10 @@ select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--
   </button>
 </header>
 <main id="stream">
+  <div id="legend">
+    <span class="left" id="lgLeft"><i class="lgh"></i>外文 → 中文</span>
+    <span class="right" id="lgRight"><i class="lgh"></i>中文 → English</span>
+  </div>
   <div id="empty"><div class="ring"></div>等待说话……</div>
 </main>
 <div id="mask"></div>
@@ -317,8 +383,44 @@ select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--
 let ws = null, reconnectDelay = 500;
 const $ = id => document.getElementById(id);
 const stream = $("stream"), empty = $("empty");
-const cards = new Map();          // id -> card element
+const cards = new Map();          // id -> turn element
 const MAX_CARDS = 50;
+// mirror of the drawer's language settings, so a bubble can label its two
+// halves with the pair actually in force rather than a hard-coded one
+let langLabels = {};
+let targets = {zh_to: "en", other_to: "zh"};
+
+// Client-side twin of asr.detect_language, used only to align a *streaming*
+// card: the backend has not sent `lang` yet while the partial is arriving, and
+// waiting for the final to pick a side would visibly flip the bubble across
+// the screen. Kana/hangul win over ideographs for the same reason as there.
+function guessSide(text){
+  if (/[\u3040-\u30ff\u31f0-\u31ff]/.test(text)) return "left";
+  if (/[\uac00-\ud7af\u1100-\u11ff]/.test(text)) return "left";
+  if (/[\u4e00-\u9fff\u3400-\u4dbf]/.test(text)) return "right";
+  return "left";
+}
+function setSide(el, side){
+  el.classList.toggle("right", side === "right");
+  el.classList.toggle("left", side !== "right");
+  const b = el.querySelector(".who");
+  // the badge is the standing label of who is talking; the pill above the
+  // text only names the language pair for that particular sentence
+  if (b) b.textContent = side === "right" ? "中" : "外";
+  refreshRuns();
+}
+// Mark every turn that continues the previous speaker, so a burst from one
+// side tightens up and shows its badge only once. Recomputed rather than
+// tracked incrementally: a removed or re-sided card can change the run
+// boundaries of its neighbours too.
+function refreshRuns(){
+  let prev = null;
+  for (const t of stream.querySelectorAll(".turn")){
+    const side = t.classList.contains("right") ? "right" : "left";
+    t.classList.toggle("cont", prev === side);
+    prev = side;
+  }
+}
 
 function esc(s){
   return String(s == null ? "" : s).replace(/[&<>"']/g,
@@ -354,25 +456,28 @@ function cardFor(id, partial){
     let el = cards.get(id);
   if (!el){
     el = document.createElement("div");
-    el.className = "card";
-    // streaming phase: blinking cursor, no translation placeholder yet
-    // (the old version showed "翻译中…" only after the final text froze).
-    // The DOA pill is present but hidden until the segment closes, since the
-    // backend picks the direction only once the utterance has ended.
+    // A chat turn: the wrapper carries the side, the bubble the styling. A
+    // partial arrives before the backend has judged the language, so it starts
+    // on the left and moves once there is text to look at.
+    el.className = "turn left";
     el.innerHTML =
-      '<div class="meta">' +
-        '<span class="pill src">partial</span>' +
-        '<span class="pill doa" hidden></span>' +
+      '<div class="bubble">' +
+        '<div class="meta">' +
+          '<span class="pill src">partial</span>' +
+          '<span class="pill doa" hidden></span>' +
+        '</div>' +
+        '<div class="src-text"></div>' +
+        (partial ? '<span class="cursor"></span>' : '') +
+        '<div class="trans"></div>' +
       '</div>' +
-      '<div class="src-text"></div>' +
-      (partial ? '<span class="cursor"></span>' : '') +
-      '<div class="trans"></div>';
+      '<span class="who"></span>';
     stream.appendChild(el);
     cards.set(id, el);
     if (cards.size > MAX_CARDS){
       const oldest = cards.keys().next().value;
       cards.get(oldest).remove();
       cards.delete(oldest);
+      refreshRuns();
     }
   }
   return el;
@@ -387,9 +492,10 @@ function stampDoa(el, doa){
   p.hidden = false;
 }
 
-// freezeCard: the utterance is complete - drop the blinking cursor and make
-// sure the translation slot shows the pending placeholder. Called for the
-// 2-pass final result, which replaces pass-1 streaming text in one shot.
+// freezeCard: the utterance is complete - drop the blinking cursor, settle the
+// turn onto its speaker's side, and make sure the translation slot shows the
+// pending placeholder. Called for the 2-pass final result, which replaces
+// pass-1 streaming text in one shot.
 function freezeCard(el, lang){
   const cur = el.querySelector(".cursor");
   if (cur) cur.remove();
@@ -398,9 +504,13 @@ function freezeCard(el, lang){
     trans.className = "trans pending";
     trans.textContent = "翻译中…";
   }
-  const pill = el.querySelector(".pill");
-  pill.textContent = (lang === "zh" ? "中→" : "外→") + (lang || "?");
-  pill.className = "pill";
+  // right = Chinese speaker, left = everybody else: the alignment itself says
+  // which direction this turn is going, so the pill only names the pair
+  setSide(el, lang === "zh" ? "right" : "left");
+  const tgt = lang === "zh" ? targets.zh_to : targets.other_to;
+  const pill = el.querySelector(".pill.src");
+  pill.textContent = langName(lang) + " → " + langName(tgt);
+  pill.className = "pill src";
 }
 
 function handle(msg){
@@ -431,12 +541,13 @@ function handle(msg){
       // animation, the card simply grows by one decode step.
       const el = cardFor(msg.id, true);
       el.querySelector(".src-text").textContent = msg.text || "";
+      setSide(el, guessSide(msg.text || ""));
       scrollIfStuck();
       break;
     }
     case "discard": {
       const el = cards.get(msg.id);
-      if (el){ el.remove(); cards.delete(msg.id); }
+      if (el){ el.remove(); cards.delete(msg.id); refreshRuns(); }
       if (!cards.size) stream.appendChild(empty);
       break;
     }
@@ -445,8 +556,7 @@ function handle(msg){
       if (el){
         const t = el.querySelector(".trans");
         t.className = "trans";
-        t.innerHTML = esc(msg.text) +
-          '<span class="lang">' + esc(msg.target_lang || "") + "</span>";
+        t.textContent = msg.text || "";
       }
       scrollIfStuck();
       break;
@@ -487,6 +597,17 @@ function onCmdResult(msg){
   }
 }
 
+function langName(code){
+  return langLabels[code] || code || "?";
+}
+// the legend is the standing reminder of which side is which; its targets
+// follow the drawer, so it never claims a direction that is not in force
+function paintLegend(){
+  $("lgRight").innerHTML = '<i class="lgh"></i>' +
+    esc("中文 → " + langName(targets.zh_to));
+  $("lgLeft").innerHTML = '<i class="lgh"></i>' +
+    esc("外文 → " + langName(targets.other_to));
+}
 function renderTargets(data){
   const opts = data.options || {};
   for (const [sel, val] of [["zhTo", data.zh_to], ["otherTo", data.other_to]]){
@@ -495,6 +616,9 @@ function renderTargets(data){
       '<option value="' + esc(code) + '"' + (code === val ? " selected" : "") +
       ">" + esc(label) + "</option>").join("");
   }
+  langLabels = opts;
+  targets = {zh_to: data.zh_to, other_to: data.other_to};
+  paintLegend();
 }
 function zoneRow(z, index){
   const div = document.createElement("div");
@@ -628,7 +752,12 @@ mask.onclick = closeDrawer;
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
 
 $("saveLangs").onclick = () => {
-  sendCmd("set_target_langs", {zh_to: $("zhTo").value, other_to: $("otherTo").value});
+  // set_target_langs answers with the pair alone (no options map), so the
+  // local mirror is updated here rather than waiting for the next
+  // get_target_langs reply
+  targets = {zh_to: $("zhTo").value, other_to: $("otherTo").value};
+  paintLegend();
+  sendCmd("set_target_langs", targets);
   toast("翻译方向已保存", "ok");
 };
 $("addZone").onclick = () => {
