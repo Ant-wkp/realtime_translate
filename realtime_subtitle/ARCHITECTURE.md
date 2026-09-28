@@ -106,6 +106,56 @@ flush 段(id) ──→ TranscriberWorker ──→ source(id) 立即广播
 
 推理仅占 ~0.4s，优化重点在切句策略（软件 VAD 连续低概率帧提前 flush）而非模型。翻译（600M）增量 ~0.2–0.4s，因与 source 广播解耦，不阻塞原文显示。
 
+### 7.1 翻译侧的实测延迟（beam 与平台）
+
+翻译是段级串行、每句一次 `translate_batch`，所以延迟直接按"每句毫秒"度量。**beam 宽度是主要杠杆**：它只乘解码次数，而 600M 模型单句解码本身就受权重加载/编码器主导。
+
+| 配置 | x86-64（8 线程） | AGX Orin（8×A78AE） |
+|---|---|---|
+| `int8` beam=4 | 246 ms | 1026 ms |
+| `int8` beam=1（当前默认） | **198 ms** | **828 ms** |
+| `int8_float32` | 426 ms | 835 ms |
+| `float32` | 995 ms | 2547 ms |
+
+beam 1→4 只换来极小的措辞差异（`It's a nice day.` / `The weather is fine today.` / `The weather is good today.`），而代价是 +25%，所以默认取贪心；`--nllb-beam` 可调回 4。**该差异只在三个句子上做过目测，不是语料级评测**，不要把它当成"beam=1 与 4 等价"的结论。
+
+两个反直觉的负结果：
+
+- `intra_threads` 在 x86 上无收益（0/4/8 = 343/328/429 ms）；在 Orin 上**设成 8 反而慢一倍**（1101 → 2271 ms），因为 8 个核全被占满后 ASR 与翻译互相抢核。默认不动它。
+- 把 CPU governor 从 `schedutil` 改成 `performance` **没有可测改善**，所以脚本不要求改 governor。
+
+Orin 比 x86 慢约 4 倍，根因不在 CPU 频率而在**后端差异**：同一份 PyPI aarch64 轮子用 `GEMM_S8 backend: Ruy`，而 x86 轮子用 Intel MKL/oneDNN（`CT2_VERBOSE=1` 可见那行 "SGEMM backend / GEMM_S8 backend"）。Ruy 的 int8 kernel 明显弱于 MKL。因此 Orin 上提升翻译速度的正确方向不是调参，而是**让它用 GPU**。
+
+按 [requirements-jetson.txt](requirements-jetson.txt) §3 编译带 CUDA 的 ctranslate2 后（`CUDA_ARCH_LIST=8.7`，Orin 原生 sm_87，无 PTX JIT），实测：
+
+| 配置 | Orin 每句 |
+|---|---|
+| CPU `int8`（PyPI 轮子，Ruy） | 828 ms |
+| GPU `float16`（源码编译，当前默认） | **346 ms**（ASR 并发下实测中位） |
+
+### 7.1.1 GPU 量化类型的选择 —— 以可靠性而非速度为准
+
+GPU 上试过三种量化类型，**`float16` 是唯一在真实运行条件下不出错的**。关键在于“真实条件”：ASR 也常驻同一块 GPU，而 int8 路径会调用 cuBLAS 的 int8 GEMM kernel，在另一路 CUDA 负载存在时会失败：
+
+| compute_type | 与 ASR 并发时 | 中位延迟 |
+|---|---|---|
+| `int8_float16` | **6/24 成功** | 320 ms |
+| `float16` | **24/24 成功** | 406 ms |
+
+`float16` 用约 +27% 的延迟换来 100% 可靠性 —— 字幕整个丢失比晚 90 ms 严重得多。这个差值实测复现两次。
+
+**排查上的教训**：单独压测（不并发）时**六种量化类型全部 15/15 通过**，因此一度误判为已修好；只有把 ASR 并发加进来才复现出 6/24。验收用例必须包含“另一路 CUDA 负载同时在跑”，否则会得到一个假阳性。
+
+即使默认已是可靠配置，`_translate_batch()` 仍保留一层兜底：GPU 上遇到 `RuntimeError` 时用 `float32` 重试一次（懒构造，仅失败时才占显存），因为用户可用 `--nllb-compute-type int8_float16` 选回不可靠路径，且驱动层瞬时错误总是可能。CPU 侧不重试 —— 没有可降级的目标，静默重试只会掩盖真问题。
+
+一次真实会话（20 段）里 GPU 翻译落在 216–411 ms，`cuBLAS` 失败 0 次。ASR 占约 3 GB 显存，与翻译共存无冲突。
+
+**必须知道的陷阱**：用 `CUDA_DYNAMIC_LOADING=ON` 编译时，ct2 在运行时按 soname dlopen cuBLAS。**不要为了“帮它找到库”而用 `ctypes` 预先再加载一份** —— 实测有害：把同一 soname 的第二个副本塞进进程后，GEMM 会选到无法服务该矩阵形状的 kernel，表现为 `CUBLAS_STATUS_NOT_SUPPORTED`。在长短句混合的 40 次里：不预加载 **20/20 成功**，预加载 torch 版 **10/20 失败**。失败是**按输入文本确定性的**（某些句子必失败，同长度的另一些从不失败），而非库冲突该有的间歇性 —— 这也是区分两者的关键。`compute.ct2_cuda_library_status()` 因此只**报告** soname 可否解析、绝不加载任何东西。
+
+### 7.2 翻译方向的持久化
+
+`runtime_settings.json`（包目录旁）保存 `zh_to` / `other_to`。这**不是**设备侧持久化——那是被 `usb_device.py` 拦截的东西，因为写 flash 的波束开关可能让设备重启后挂起；这里只是一个普通 JSON 文件。加它的起因是一个真实误报：方向原本硬编码为 `zh_to="en"` 且不存盘，**重启后设置静默丢失**，看起来就像"选了日语仍然翻译成英语"。读取时机容错：文件损坏回退默认值，语言码不在 `LANG_TO_NLLB`/`TARGET_LANGS` 里则丢弃，绝不让一个坏文件挡住启动。
+
 ## 8. 波束：为什么不再由程序配置
 
 设备有 2 个可编程固定波束（beam1/beam2，`AEC_FIXEDBEAM*`），另有 free-running 与 auto-select 两个由固件派生。程序**不再**在启动时转向或改路由：目标场景是"噪声里稳定识别一个人"，而固件默认输出（`AUDIO_MGR_OP_ALL` 出厂配置，L=处理输出、R=ASR 波束输出）本身就在做这件事。用软件重配会引入必须回滚的设备状态，却没换来识别质量。

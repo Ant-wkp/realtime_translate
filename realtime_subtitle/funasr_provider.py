@@ -8,12 +8,65 @@ re-decodes the whole utterance with the offline model for the final result.
 
 from __future__ import annotations
 
+import glob
+import os
 import time
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from .asr import AsrProvider, AsrResult
+from .compute import resolve_torch_device
+
+
+# FunASR accepts either a hub alias ("paraformer-zh") or a real model id
+# ("iic/speech_seaco_paraformer_..."). An alias makes FunASR query the hub to
+# translate it, and that request is fatal when it fails: the raised error is
+# `RuntimeError: model 'paraformer-zh' is not registered`, which reads like a
+# packaging problem but actually means "could not reach modelscope.cn". The
+# models were already on disk, so an offline host could not start at all.
+#
+# Resolution therefore prefers the local cache: the alias -> id mapping is
+# copied from funasr/download/name_maps_from_hub.py, and modelscope's own
+# on-disk layout is reconstructed to check for a complete download. Only when
+# nothing local matches does the alias get handed to FunASR as before.
+_HUB_ALIASES = {
+    "paraformer-zh": "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+    "paraformer-zh-streaming": "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
+    "ct-punc": "iic/punc_ct-transformer_cn-en-common-vocab471067-large",
+}
+
+# Files that prove a model directory is usable. configuration.json is written
+# last by the downloader and the framework needs both, so requiring them
+# avoids accepting a half-finished snapshot.
+_REQUIRED_MODEL_FILES = ("configuration.json", "config.yaml")
+
+
+def _local_model_path(alias: str) -> str | None:
+    """Return an on-disk model directory for a hub alias, if one is complete.
+
+    Looks in the modelscope cache (and MODELSCOPE_CACHE when set). Returns None
+    to mean "let FunASR resolve this alias itself" - so an unsupported alias or
+    an empty cache keeps the previous behaviour rather than failing.
+    """
+    model_id = _HUB_ALIASES.get(alias)
+    if not model_id:
+        return None
+    roots = []
+    env = os.environ.get("MODELSCOPE_CACHE")
+    if env:
+        roots.append(os.path.join(env, "models"))
+    roots.append(os.path.expanduser("~/.cache/modelscope/models"))
+    # Dots become dashes in the cache directory name, e.g.
+    # iic/speech_x -> iic--speech_x
+    dir_name = model_id.replace("/", "--").replace(".", "-")
+    for root in roots:
+        pattern = os.path.join(root, dir_name, "snapshots", "*")
+        for snap in sorted(glob.glob(pattern), reverse=True):
+            if all(os.path.isfile(os.path.join(snap, f))
+                   for f in _REQUIRED_MODEL_FILES):
+                return snap
+    return None
 
 
 @dataclass
@@ -47,17 +100,83 @@ class FunasrProvider(AsrProvider):
     ENCODER_LOOK_BACK = 4
     DECODER_LOOK_BACK = 1
 
-    def __init__(self, sample_rate: int = 16000, chunk_size: list | None = None):
+    def __init__(self, sample_rate: int = 16000, chunk_size: list | None = None,
+                 device: str = "auto"):
+        # FunASR's frontend imports torchaudio, which has no matching wheel on
+        # some aarch64 setups. Its own setup.py offers kaldi-native-fbank as a
+        # fallback backend for exactly that case, but the package only pulls it
+        # in via the `knf` extra, so it is requested here when torchaudio is
+        # missing instead of failing at model load.
+        self._ensure_audio_backend()
+
         from funasr import AutoModel
 
         self.chunk_size = list(chunk_size) if chunk_size else list(self.CHUNK_SIZE_480)
-        self._offline = AutoModel(model="paraformer-zh", disable_update=True)
-        self._punc = AutoModel(model="ct-punc", disable_update=True)
+        # Resolve here instead of letting AutoModel decide: its own default is
+        # device="cuda" with a silent fallback to cpu when torch cannot see a
+        # GPU, which makes "did it really use the GPU?" unanswerable from the
+        # logs. Passing an explicit device means the banner states the truth.
+        self.device = resolve_torch_device(device)
+
+        def resolve(name: str) -> str:
+            local = _local_model_path(name)
+            if local:
+                return local
+            print(f"[ASR] {name}: no complete local copy, letting FunASR "
+                  f"resolve it (needs network)")
+            return name
+
+        self._offline = AutoModel(model=resolve("paraformer-zh"),
+                                  disable_update=True, device=self.device)
+        self._punc = AutoModel(model=resolve("ct-punc"),
+                               disable_update=True, device=self.device)
         try:
-            self._stream = AutoModel(model="paraformer-zh-streaming", disable_update=True)
+            self._stream = AutoModel(model=resolve("paraformer-zh-streaming"),
+                                     disable_update=True,
+                                     device=self.device)
         except Exception:  # noqa: BLE001 - streaming optional
             self._stream = None
         self._utts: dict[str, _Utterance] = {}
+
+    @staticmethod
+    def _ensure_audio_backend() -> None:
+        """Install kaldi-native-fbank when torchaudio is unavailable.
+
+        aarch64 hosts (Jetsons in particular) occasionally have no torchaudio
+        wheel matching their torch, and FunASR's fbank front-end then fails to
+        import. The fallback is FunASR's own supported path, so it is resolved
+        here rather than left to the user - but only when it is actually
+        needed, so an x86 host with a working torchaudio is untouched.
+        """
+        try:
+            import torchaudio  # noqa: F401
+        except Exception:  # noqa: BLE001 - ImportError or a broken .so
+            try:
+                import kaldi_native_fbank  # noqa: F401
+            except ImportError:
+                import subprocess
+                import sys as _sys
+
+                print("[ASR] torchaudio unavailable; installing "
+                      "kaldi-native-fbank fallback frontend")
+                subprocess.run(
+                    [_sys.executable, "-m", "pip", "install", "-q",
+                     "kaldi-native-fbank"],
+                    check=False,
+                )
+
+    def describe_device(self) -> str:
+        """Device actually backing the loaded models, for the banner.
+
+        Read back from the model objects rather than echoing the request, so
+        that a FunASR-internal fallback shows up instead of being reported as
+        a successful GPU run."""
+        for mdl in (self._offline, self._stream):
+            inner = getattr(mdl, "model", None)
+            found = getattr(inner, "device", None)
+            if found is not None:
+                return str(found)
+        return self.device
 
     # ------------------------------------------------------------------
     # offline

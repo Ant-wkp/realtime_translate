@@ -751,13 +751,24 @@ $("gear").onclick = () => drawer.classList.contains("show") ? closeDrawer() : op
 mask.onclick = closeDrawer;
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
 
-$("saveLangs").onclick = () => {
+// The drawer's promise is "runtime config takes effect immediately", so the
+// selects apply on change instead of waiting for the button. That mattered:
+// the <select> keeps its own selection, so picking "Japanese" *looked* applied
+// while the backend was still on the default zh_to="en" and kept translating
+// to English until the button was pressed. The button stays as an explicit
+// affordance but is no longer the only way to commit.
+function commitLangs(){
   // set_target_langs answers with the pair alone (no options map), so the
   // local mirror is updated here rather than waiting for the next
   // get_target_langs reply
   targets = {zh_to: $("zhTo").value, other_to: $("otherTo").value};
   paintLegend();
   sendCmd("set_target_langs", targets);
+}
+$("zhTo").onchange = commitLangs;
+$("otherTo").onchange = commitLangs;
+$("saveLangs").onclick = () => {
+  commitLangs();
   toast("翻译方向已保存", "ok");
 };
 $("addZone").onclick = () => {

@@ -36,6 +36,7 @@ if __package__ is None or __package__ == "":
     __package__ = "realtime_subtitle"
 
 from .asr import AsrResult, detect_language
+from .compute import DEVICE_CHOICES, describe_platform
 from .segmenter import SegmentCfg, Segmenter, trim_tail
 
 # avoid XET download failures with huggingface_hub
@@ -250,9 +251,45 @@ def parse_args(argv=None):
                         "so the model decodes the opening words immediately "
                         "instead of waiting 600ms for a full chunk")
     p.add_argument("--list-devices", action="store_true")
+    p.add_argument("--device-type", choices=list(DEVICE_CHOICES),
+                   default="auto",
+                   help="inference device: 'auto' (default) uses CUDA when it "
+                        "is actually available, otherwise CPU")
+    p.add_argument("--nllb-device", choices=list(DEVICE_CHOICES),
+                   default=None,
+                   help="override --device-type for the translator only. "
+                        "CTranslate2 on aarch64 is a CPU-only build on PyPI, "
+                        "so its own 'auto' degrades to CPU when CUDA is "
+                        "missing instead of aborting")
+    p.add_argument("--nllb-compute-type", default=None,
+                   help="pin the CTranslate2 quantisation (e.g. int8, "
+                        "int8_float16, float16); default follows the device")
+    p.add_argument("--nllb-beam", type=int, default=None,
+                   help="NLLB beam width. Default is greedy (1), which is "
+                        "about 20%% faster than 4 on both x86 and Orin; raise "
+                        "it to 4+ if a translation reads badly")
+    p.add_argument("--vad-device", choices=list(DEVICE_CHOICES),
+                   default="cpu",
+                   help="Silero VAD device; CPU by default because the model "
+                        "runs 30 times per second and GPU launch overhead "
+                        "outweighs the gain")
+    p.add_argument("--no-hw-vad", action="store_true",
+                   help="gate on the software VAD alone. Needed when the "
+                        "XVF3800 control plane is unavailable, otherwise the "
+                        "hardware speech flag stays 0 and no segment ever "
+                        "opens (silent, no error)")
+    p.add_argument("--host", default="0.0.0.0",
+                   help="web server bind address (default 0.0.0.0 so the "
+                        "page is reachable from the LAN)")
     p.add_argument("--debug-gate", action="store_true",
                    help="print per-tick gate inputs and every discard reason")
     return p.parse_args(argv)
+
+
+# name fragments that identify the array across platforms. The XVF3800 shows
+# up as "reSpeaker XVF3800" under PipeWire/Pulse and as the ALSA card name on a
+# host without a sound server, so the match is a list rather than one string.
+ARRAY_DEVICE_NAMES = ("respeaker xvf3800", "xvf3800", "respeaker")
 
 
 def resolve_input_device(name: str | None) -> int:
@@ -265,10 +302,17 @@ def resolve_input_device(name: str | None) -> int:
         for d in devs:
             if name.lower() in d["name"].lower():
                 return d["index"]
-        raise RuntimeError(f"input device not found: {name}")
+        # List what does exist: on a new host the ALSA naming is unpredictable
+        # and "input device not found: x" alone gives nothing to search for.
+        listing = "\n".join(f"  [{d['index']}] {d['name']} "
+                            f"({d['max_input_channels']} ch)" for d in devs)
+        raise RuntimeError(
+            f"input device not found: {name}\n"
+            f"available input devices:\n{listing or '  (none)'}"
+        )
     # auto-detect the reSpeaker XVF3800 audio interface
     for d in devs:
-        if "xvf3800" in d["name"].lower() or "reSpeaker XVF3800" in d["name"]:
+        if any(frag in d["name"].lower() for frag in ARRAY_DEVICE_NAMES):
             return d["index"]
     # hardware not found: fall back to the default device but say so
     default = sd.default.device[0]
@@ -295,6 +339,10 @@ def resolve_audio_channel(args, in_channels: int) -> tuple[int, str]:
     mapping = {"conference": 0, "asr": 1}
     idx = mapping[args.audio_source]
     if idx >= in_channels:
+        # a device with a single input channel still has to yield a channel 0
+        print(f"[audio] WARNING: --audio-source {args.audio_source} needs "
+              f"channel {idx + 1} but the device exposes {in_channels}; "
+              f"falling back to ch1")
         idx = 0
     desc = {
         "conference": "Conference processed output (AEC+beam+post)",
@@ -323,13 +371,31 @@ def main(argv=None) -> int:
         print("[USB] XVF3800 control plane connected")
     except Exception as exc:  # noqa: BLE001
         print(f"[USB] control plane unavailable: {exc}")
+    if device is None and not args.no_hw_vad:
+        # Without the control plane the hardware speech flag is pinned to 0
+        # and the gate can never open: the program still starts, prints its
+        # banner and then produces nothing at all. An explicit instruction is
+        # better than that silence.
+        print("[USB] WARNING: no hardware VAD - the gate is hardware AND "
+              "software, so nothing will be recognized. Re-run with "
+              "--no-hw-vad to gate on the software VAD alone.")
 
     # ---- audio input ---------------------------------------------------
     input_device = resolve_input_device(args.device)
     dev_info = sd.query_devices(input_device, "input")
     in_channels = args.in_channels or dev_info["max_input_channels"]
     ch_index, ch_desc = resolve_audio_channel(args, in_channels)
-    print(f"[audio] device {input_device}, {in_channels} ch, extract ch{ch_index + 1}: {ch_desc}")
+    # Validate before the stream opens: the index is consumed inside the
+    # PortAudio callback, where an IndexError surfaces on a foreign thread as
+    # an unhandled callback exception rather than a usable message.
+    if not 0 <= ch_index < in_channels:
+        raise SystemExit(
+            f"--ch {ch_index} is out of range for '{dev_info['name']}' "
+            f"({in_channels} input channels)"
+        )
+    print(f"[audio] device {input_device}, {in_channels} ch, "
+          f"extract ch{ch_index + 1}: {ch_desc}")
+    print(f"[compute] {describe_platform()}")
 
     from .speaker_locator import SpeakerLocator
     from .sw_vad import SileroVad
@@ -345,26 +411,34 @@ def main(argv=None) -> int:
 
     chunk = (FunasrProvider.CHUNK_SIZE_480 if args.asr_chunk_size == "480"
              else FunasrProvider.CHUNK_SIZE_600)
-    provider = FunasrProvider(chunk_size=chunk)
+    provider = FunasrProvider(chunk_size=chunk, device=args.device_type)
     print(f"[ASR] FunASR Paraformer (zh, streaming 2pass, "
-          f"stride {chunk[1] * 60}ms)")
+          f"stride {chunk[1] * 60}ms, device {provider.describe_device()})")
 
-    from .translator import NllbCTranslate2Provider
+    from .translator import DEFAULT_BEAM_SIZE, NllbCTranslate2Provider
 
-    translator = NllbCTranslate2Provider()
-    print(f"[NLLB] model: {translator.model_path}")
+    translator = NllbCTranslate2Provider(
+        device=args.nllb_device or args.device_type,
+        compute_type=args.nllb_compute_type,
+        beam_size=args.nllb_beam or DEFAULT_BEAM_SIZE,
+    )
+    print(f"[NLLB] model: {translator.model_path} "
+          f"({translator.device}, {translator.compute_type}, "
+          f"beam {translator.beam_size}, "
+          f"{translator.zh_to}<-zh / {translator.other_to}<-other)")
 
-    sw_vad = SileroVad(threshold=SW_FRAME_THRESHOLD)
-    print("[VAD] Silero software VAD ready")
+    sw_vad = SileroVad(threshold=SW_FRAME_THRESHOLD, device=args.vad_device)
+    print(f"[VAD] Silero software VAD ready (device {sw_vad.device})")
 
     # ---- servers ---------------------------------------------------------
     from .control import ControlHandler
     from .ws_server import BroadcastServer
 
-    server = BroadcastServer(port=args.port)
+    server = BroadcastServer(host=args.host, port=args.port)
     server.start()
     control = ControlHandler(device, locator, translator)
-    print(f"[WS] subtitle service: http://0.0.0.0:{args.port}/")
+    print(f"[WS] subtitle service: http://{args.host}:{args.port}/ "
+          f"(from another machine use this host's IP)")
 
     # per-segment timing anchors for end-to-end latency stats
     speech_end_at: dict[str, float] = {}
@@ -465,7 +539,14 @@ def main(argv=None) -> int:
         that can be talked into a false positive by steady noise. Requiring
         both keeps a doorbell out of the segmenter, and the segmenter's own
         ratio filter then re-checks the same probability at flush time.
+
+        With --no-hw-vad the hardware operand is dropped rather than
+        satisfied artificially: that flag is pinned to 0 whenever the control
+        plane is unavailable, so keeping it in the expression would gate out
+        every segment.
         """
+        if args.no_hw_vad:
+            return sw_prob >= SW_FRAME_THRESHOLD
         return hw_vad == 1 and sw_prob >= SW_FRAME_THRESHOLD
 
     def apply_actions(actions):

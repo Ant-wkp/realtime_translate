@@ -15,6 +15,8 @@ import os
 
 import numpy as np
 
+from .compute import resolve_torch_device
+
 SAMPLE_RATE = 16000
 FRAME_SIZE = 512  # 32 ms at 16 kHz
 
@@ -46,8 +48,13 @@ class SileroVad(SoftwareVad):
 
     name = "silero"
 
-    def __init__(self, threshold: float = 0.5):
+    def __init__(self, threshold: float = 0.5, device: str = "cpu"):
         self.threshold = threshold
+        # CPU by default even on a CUDA host. The model is tiny and is called
+        # once per 512-sample frame (every 32 ms of audio, inside the 100 ms
+        # tick), so per-call kernel-launch overhead dominates any gain and a
+        # CUDA Silero would also compete with the ASR model for device memory.
+        self.device = resolve_torch_device(device)
         self._carry = np.zeros(0, dtype=np.float32)
         self._last_prob = 0.0
         self._model = None
@@ -70,6 +77,7 @@ class SileroVad(SoftwareVad):
             from silero_vad import load_silero_vad
 
             self._model = load_silero_vad()
+            self._to_device()
             self.reset()
             return
         except ImportError:
@@ -80,12 +88,29 @@ class SileroVad(SoftwareVad):
         for path in jit_paths:
             if os.path.isfile(path):
                 self._model = torch.jit.load(path)
+                self._to_device()
                 self.reset()
                 return
         raise RuntimeError(
             "Silero VAD requires the silero-vad package or a local "
             "silero_vad.jit model file"
         )
+
+    def _to_device(self) -> None:
+        """Move the loaded model to self.device when it supports .to().
+
+        The pip package's JIT module is not a plain nn.Module and has no
+        .to(); a local silero_vad.jit ScriptModule does. Staying on CPU would
+        be worse than failing, so a missing .to() is tolerated rather than
+        raised.
+        """
+        move = getattr(self._model, "to", None)
+        if move is None:
+            return
+        try:
+            self._model = move(self.device)
+        except Exception:  # noqa: BLE001 - keep the model where it loaded
+            pass
 
     # ------------------------------------------------------------------
     # inference
@@ -113,9 +138,12 @@ class SileroVad(SoftwareVad):
         import torch
 
         with torch.no_grad():
+            audio = torch.from_numpy(frame.astype(np.float32)).unsqueeze(0)
+            if self.device != "cpu":
+                audio = audio.to(self.device)
             prob = self._model(
-                torch.from_numpy(frame.astype(np.float32)).unsqueeze(0),
-                torch.tensor(SAMPLE_RATE),
+                audio,
+                torch.tensor(SAMPLE_RATE, device=audio.device),
             )
         return float(prob.item())
 

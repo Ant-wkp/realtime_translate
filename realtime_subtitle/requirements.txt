@@ -1,8 +1,21 @@
+# Cross-platform: installs and runs unchanged on x86-64 and on aarch64.
+# The GPU difference is not a dependency difference - it is resolved at
+# runtime by compute.py, which probes what the installed builds can do.
+#
+# Two packages are special on aarch64 (Jetson):
+#   * torch / torchaudio must be CUDA builds, not whatever plain `pip
+#     install torch` resolves to. See requirements-jetson.txt.
+#   * ctranslate2 from PyPI is a CPU-only build on aarch64; GPU execution
+#     needs a local build (also covered there). The pipeline degrades to CPU
+#     int8 without it.
+#
+# There is deliberately no onnxruntime here anymore: the Silero v5 ONNX
+# export misreports speech probability (~0.001 on real speech), so the VAD
+# runs on the torch JIT model only.
 numpy
 sounddevice
 websockets
 silero-vad
-onnxruntime
 ctranslate2
 sentencepiece
 pyusb

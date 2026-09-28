@@ -1,0 +1,262 @@
+# Jetson (aarch64) specifics - these are notes, not a pip requirements file.
+#
+# Verified against the actual target on 2026-09-24: NVIDIA Jetson AGX Orin
+# Developer Kit, L4T R39.2 (kernel 6.8.12-1021-tegra), Ubuntu 24.04 (noble),
+# aarch64, Python 3.12.3, driver 595.78 / CUDA 13.2.
+#
+# ---------------------------------------------------------------------------
+# 1. System packages (apt; NOT obtainable from pip)
+# ---------------------------------------------------------------------------
+#   libportaudio2     - sounddevice is a ctypes binding; without the system
+#                       shared library `import sounddevice` fails with
+#                       "OSError: PortAudio library not found".
+#   python3-venv      - the venv module is not installed by default.
+#   python3-pip       - likewise; `python3 -m venv` produces an env with no pip.
+#   build-essential   - g++/make, needed if CTranslate2 is built locally.
+#
+#   sudo apt-get install -y python3-pip python3-venv libportaudio2 build-essential
+#
+# ---------------------------------------------------------------------------
+# 2. torch / torchaudio - must be the CUDA build
+# ---------------------------------------------------------------------------
+# PyPI's aarch64 wheels for torch are CPU-only: installing them yields a torch
+# where torch.cuda.is_available() is False and every model silently runs on
+# CPU. PyTorch's own index serves aarch64 CUDA wheels, so no NVIDIA-specific
+# index is required on this platform:
+#
+#   pip install --extra-index-url https://download.pytorch.org/whl/cu130 \
+#       "torch==2.13.0+cu130" "torchaudio==2.11.0+cu130"
+#
+# The version pairing matters: torch 2.13 pairs with torchaudio 2.11 (the
+# torchaudio versions are not aligned with torch's; 2.13 was skipped after the
+# 2.10/2.11 line). Both exist as cp312 manylinux_2_28_aarch64 wheels.
+#
+# CUDA index choice: the host reports CUDA 13.2, and wheels are published for
+# 12.8 / 12.9 / 13.0. The wheels bundle their own CUDA runtime (nvidia-* deps),
+# so cu130 works on a 13.2 driver - pick the closest published line.
+#
+# Verify before trusting anything else:
+#
+#   python -c "import torch; print(torch.__version__, torch.version.cuda, \
+#              torch.cuda.is_available())"
+#
+# torch.cuda.is_available() must be True. (`torch.version.cuda` being non-None
+# only proves the wheel is a CUDA build - it is also non-None on a machine with
+# no GPU at all, such as the x86 development host.)
+#
+# ---------------------------------------------------------------------------
+# 2b. About the sm_87 warning on Orin (expected, not a problem)
+# ---------------------------------------------------------------------------
+# On the first CUDA call, torch prints:
+#
+#   Found GPU0 Orin which is of compute capability (CC) 8.7.
+#   ...
+#   - 8.0 which supports hardware CC >=8.0,<9.0 except {8.7}
+#   No published PyTorch CUDA builds for release 2.13.0+cu130 support this GPU.
+#
+# This is inherent to PyTorch's published wheels, not to the platform choice:
+# get_arch_list() returns ['sm_80','sm_90','sm_100','sm_110','sm_120'] on the
+# aarch64 wheel and ['sm_75','sm_80','sm_86','sm_90','sm_100','sm_120'] on the
+# x86 wheel - neither includes sm_87, which is the Orin-specific target.
+# NVIDIA's own redist (developer.download.nvidia.com/compute/redist/jp/) keys
+# wheels by JetPack major version and only ships cp310 builds for jp6, so it
+# does not cover this host either (L4T 39.x, Python 3.12).
+#
+# The wheels still execute: kernels for sm_80 are JIT-compiled from PTX for
+# sm_87 on first use. Measured cost on AGX Orin:
+#
+#   first matmul (incl. JIT)  46 ms  ->  warmed-up steady state  22 ms
+#   Conv1d x50 warmed up      96 ms total (1.9 ms per call)
+#
+# and results are numerically correct (512x512 matmul vs CPU: max relative
+# error 8.94e-07). So the warning can be ignored for this workload. The one
+# thing worth remembering is that the *first* inference after a fresh driver
+# state pays a few tens of milliseconds of JIT, which is why the ASR banner
+# device line is printed at load time rather than at first use.
+#
+# To silence it (and avoid JIT entirely), install a build compiled with
+# TORCH_CUDA_ARCH_LIST=8.7 - either from a JetPack-specific NVIDIA wheel when
+# one is published for this L4T release, or by building PyTorch from source.
+#
+# ---------------------------------------------------------------------------
+# 3. ctranslate2: GPU needs a local build (verified end to end)
+# ---------------------------------------------------------------------------
+# The aarch64 wheel published on PyPI is built without CUDA (the project's
+# release CI compiles the x86 wheel with -DWITH_CUDA=ON but the aarch64 wheel
+# with OpenBLAS/Ruy only). It therefore runs translation on CPU with the Ruy
+# int8 kernels, which is the reason a Jetson translates ~4x slower than an x86
+# host: measured 828 ms/segment on an Orin versus 198 ms on x86 for the same
+# int8 weights and the same text. Nothing about the CPU is wrong - the
+# governor was pinned to `performance` with no effect; the GEMM backend is.
+# The code degrades to that path with a warning rather than failing, so this
+# section is optional - but it is the only real speed lever.
+#
+# Verified working sequence on L4T 39.2 / CUDA 13.2 (Orin, CC 8.7). Result:
+# 371 ms/segment, 216-411 ms across a live session, 0 failures.
+#
+#   # toolchain (nvcc is not installed by default, and lands outside PATH)
+#   sudo apt-get install -y cuda-compiler-13-2 cmake build-essential \
+#       cudnn9-cuda-13 libcublas-dev-13-2 libcurand-dev-13-2
+#   export PATH=/usr/local/cuda-13.2/bin:$PATH
+#
+#   git clone --depth=1 --recursive https://github.com/OpenNMT/CTranslate2
+#   cd CTranslate2
+#
+#   # Do NOT run `git submodule update --init --recursive`: it hangs/aborts on
+#   # cutlass and thrust (hundreds of MB). Fetch only what is needed:
+#   git submodule update --init --depth=1 third_party/spdlog
+#   git submodule update --init --depth=1 third_party/ruy
+#   # `third_party/thrust` is actually NVIDIA/cccl and must contain cub,
+#   # thrust and libcudacxx (CMakeLists.txt references third_party/thrust/cub,
+#   # .../thrust and .../libcudacxx/include). Cloning NVIDIA/thrust alone is
+#   # not enough - it has no cub/:
+#   rm -rf third_party/thrust
+#   git clone --depth=1 --branch v2.7.0 https://github.com/NVIDIA/cccl \
+#       third_party/thrust
+#
+#   mkdir build && cd build
+#   cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_CLI=OFF -DWITH_MKL=OFF \
+#       -DOPENMP_RUNTIME=COMP -DWITH_CUDA=ON -DWITH_CUDNN=ON \
+#       -DCUDA_DYNAMIC_LOADING=ON -DCUDA_ARCH_LIST=8.7 \
+#       -DWITH_TENSOR_PARALLEL=OFF -DCUDNN_ROOT=/usr \
+#       -DCMAKE_INSTALL_PREFIX=$PWD/install
+#   make -j6 && make install
+#
+# CUDA_ARCH_LIST=8.7 is worth setting explicitly: it produces
+# `arch=compute_87,code=sm_87` (native Orin code, no PTX JIT step at runtime),
+# unlike the PyTorch wheels which carry no sm_87 at all.
+#
+# Install both halves - the C++ library and the Python module:
+#
+#   sudo cp -a build/install/lib/libctranslate2.so* /usr/local/lib/ && sudo ldconfig
+#   cd ../python && pip install -r install_requirements.txt
+#   python setup.py bdist_wheel
+#   pip install --force-reinstall --no-deps dist/ctranslate2-*.whl
+#
+# Note the source build's CPU backend only advertises float32 (it is compiled
+# without MKL/oneDNN/Ruy), so the CPU fallback is slower than the PyPI wheel's
+# int8 path. Keep both wheels around if you want to compare:
+#
+#   pip install --force-reinstall ctranslate2==4.8.2     # back to the PyPI one
+#
+# Verify on the target:
+#
+#   python -c "import ctranslate2; print(ctranslate2.get_cuda_device_count(), \
+#              ctranslate2.get_supported_compute_types('cuda'))"
+#
+# ---------------------------------------------------------------------------
+# 3b. The one CUDA-library trap: do NOT preload cuBLAS
+# ---------------------------------------------------------------------------
+# Required setup, once: the toolkit's sonames must be visible to the linker.
+#
+#   sudo cp -a build/install/lib/libctranslate2.so* /usr/local/lib/ && sudo ldconfig
+#   # cudnn9-cuda-13 + libcublas-dev-13-2 provide libcudnn.so.9 / libcublas.so.13
+#   ldconfig -p | grep -E "libcublas.so.13|libcudnn.so.9"      # confirm
+#
+# A CUDA_DYNAMIC_LOADING=ON ct2 build links nothing against CUDA and dlopens
+# those sonames on first use, so they must resolve through the normal search
+# path. Check it from outside the program:
+#
+#   python -c "import ctypes; [ctypes.CDLL(l) for l in \
+#       ('libcublasLt.so.13','libcublas.so.13','libcudnn.so.9')]"
+#
+# What NOT to do: preloading a second copy with ctypes+RTLD_GLOBAL to "help"
+# ct2 find the library. That was tried and measured to be harmful. On an Orin
+# with torch installed, over a mix of short and long inputs:
+#
+#   no preload                       -> 20 ok /  0 failed
+#   preload torch's nvidia/cu13 copy -> 10 ok / 10 failed
+#
+# The failures were deterministic per input text - one specific sentence failed
+# on every attempt while a similar-length one never failed - with
+# `cuBLAS failed with status CUBLAS_STATUS_NOT_SUPPORTED`. A genuine library
+# clash would be intermittent, not input-dependent; what actually happens is
+# that a second libcublas in the process gives the same soname two candidates,
+# and ct2's GEMM kernel selection then picks one unable to serve the required
+# shape.
+#
+# This is worth spelling out because the trap is easy to fall into twice: the
+# short sentences used in the first measurement succeeded either way, so the
+# preload looked beneficial until longer texts were included. Including both
+# lengths in the acceptance test is what exposed it.
+#
+# `compute.ct2_cuda_library_status()` therefore only *reports* whether the
+# sonames resolve - it never loads anything - and the translator logs a warning
+# at startup when they do not, turning the failure into a clear message instead
+# of a RuntimeError on the first subtitle.
+#
+# ---------------------------------------------------------------------------
+# 3c. Which compute type: float16, not int8
+# ---------------------------------------------------------------------------
+# On GPU the quantisation is picked for reliability. Measured with FunASR
+# (also on the GPU) running concurrently, which is how the program actually
+# behaves:
+#
+#   compute_type    success rate    median latency
+#   int8_float16    6/24            320 ms
+#   float16         24/24           406 ms
+#
+# The int8 GPU path calls cuBLAS int8 GEMM kernels that fail with
+# `CUBLAS_STATUS_NOT_SUPPORTED` while another CUDA workload is active. The
+# default is therefore float16, costing ~27% more per segment and never
+# failing.
+#
+# Testing gotcha that cost real time here: with no concurrent workload, all
+# six compute types passed 15/15, which looked like proof the problem was
+# gone. The concurrency is what reproduces it. Any acceptance test for this
+# path must have a second CUDA workload running.
+#
+# `int8_float16` is still reachable with --nllb-compute-type for comparison,
+# and _translate_batch() retries once in float32 if a GPU call raises, so a
+# failure degrades instead of losing the subtitle.
+#
+# ---------------------------------------------------------------------------
+# 3d. Offline startup: keep the local model cache authoritative
+# ---------------------------------------------------------------------------
+# FunASR accepts hub aliases like "paraformer-zh". Resolving such an alias
+# requires asking modelscope.cn, and when that request fails the error is
+# misleading:
+#
+#   RuntimeError: model 'paraformer-zh' is not registered.
+#
+# That reads like a broken install but actually means "the hub was
+# unreachable". With a complete local cache, an offline host would still fail
+# to start. `funasr_provider._local_model_path()` therefore maps the three
+# aliases this project uses to their model ids and resolves them against
+# `~/.cache/modelscope/models/<id-with-slashes-as-->-and-dots-as-->`
+# directly, only falling back to FunASR's own resolution when no complete
+# local copy exists.
+#
+# A model directory counts as complete when configuration.json and
+# config.yaml are both present (the downloader writes configuration.json
+# last, so this rejects half-finished snapshots).
+#
+# Verify with the network deliberately broken:
+#
+#   http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 \
+#       python main.py --device "reSpeaker XVF3800"
+#
+# A correct setup starts normally and logs zero connection failures. Note that
+# FunASR still attempts a hub check when given a bare alias, so the banner
+# prints "no complete local copy, letting FunASR resolve it (needs network)"
+# in that case - if you see it for a model you know is cached, the cache path
+# or directory naming does not match what the resolver expects.
+#
+# ---------------------------------------------------------------------------
+# 4. Offline deployment note (models)
+# ---------------------------------------------------------------------------
+# Weights are platform independent - a CT2 int8 checkpoint and a Paraformer
+# state_dict carry no CPU/GPU flag. They can be copied verbatim with rsync.
+#
+# Two gotchas when copying a HuggingFace cache:
+#   * the snapshot files are *symlinks* into ../blobs/, so `rsync -a` must be
+#     used (and the blobs directory must come along), otherwise every file
+#     arrives as a dangling link;
+#   * rsync does not create missing parent directories on the receiving side -
+#     `mkdir -p ~/.cache/huggingface/hub` first or the transfer fails with
+#     "mkdir ... failed: No such file or directory".
+#
+# The NLLB model location can be pinned explicitly, which avoids having to
+# reproduce the models--<org>--<name>/snapshots/<rev> layout:
+#
+#   NLLB_MODEL_DIR=/path/to/ct2-model python main.py
