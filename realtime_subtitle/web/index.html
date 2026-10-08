@@ -15,12 +15,6 @@
   --accent-2: #7b6cf6;
   --ok: #34d399; --err: #f87171; --info: #60a5fa;
   --bg: #0a0f1e;
-  /* The page paints its own dark background, but form controls are drawn by
-     the UA, not by us: without this the <select> dropdown opened as a white
-     panel with near-white text, i.e. unreadable. Declaring the scheme here
-     puts every control (including the option list, which is rendered outside
-     the drawer and cannot be reached by ordinary selectors) into the dark
-     branch. */
   color-scheme: dark;
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -33,14 +27,10 @@ body{
     radial-gradient(60rem 40rem at 15% 10%, rgba(76,201,240,.14), transparent 60%),
     radial-gradient(50rem 36rem at 85% 45%, rgba(123,108,246,.12), transparent 60%),
     radial-gradient(46rem 30rem at 50% 100%, rgba(251,146,60,.07), transparent 65%);
-  /* the header and the subtitle list are the only two children, and the list
-     is the one that scrolls - so the page itself must never scroll, or the
-     newest card would be chased through two scroll ports at once */
+
   display:flex;flex-direction:column;overflow:hidden;
 }
-/* The page no longer scrolls (the list does), so "sticky" would stick to a
-   scrollport that never moves - relative keeps the stacking order without
-   implying otherwise. */
+
 header{
   position:relative;z-index:5;display:flex;align-items:center;gap:.7rem;
   padding:.8rem 1.1rem;
@@ -74,21 +64,12 @@ header h1{font-size:1rem;font-weight:600;letter-spacing:.02em}
   transition:transform .35s ease, background .2s}
 #gear:hover{transform:rotate(45deg);background:var(--glass-strong)}
 #gear svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6}
-/* The subtitle list is its own scroll container rather than the page: the
-   newest card is then anchored to the real bottom of the viewport, and there
-   is only one scrollable to measure. The bottom padding is clearance for the
-   toast, which floats over this box. */
-/* The dialogue column is deliberately wide: with a narrow centred column the
-   two sides sit far from the window edges and the left/right split reads as
-   "centred text" rather than as two parties. The bubbles cap their own text
-   width instead, so widening this box buys side clearance without producing
-   over-long lines. */
+
 main{max-width:1500px;margin:0 auto;width:100%;flex:1;min-height:0;
   overflow-y:auto;overscroll-behavior:contain;
   padding:1.1rem clamp(1rem,3vw,3rem) 4.5rem;
   display:flex;flex-direction:column;gap:.75rem}
-/* Who speaks on which side. Sticky so the mapping stays put while the
-   dialogue scrolls underneath it. */
+
 #legend{position:sticky;top:0;z-index:3;display:flex;justify-content:space-between;
   gap:.4rem;font-size:.68rem;margin-bottom:.1rem}
 #legend span{display:inline-flex;align-items:center;gap:.35em;max-width:min(48%,30rem);
@@ -102,9 +83,7 @@ main{max-width:1500px;margin:0 auto;width:100%;flex:1;min-height:0;
 #legend .right{color:var(--accent)}
 #empty{display:flex;flex-direction:column;align-items:center;gap:1.35rem;
   padding:4rem 0;color:var(--text-dim)}
-/* breathing wait ring: a single hollow ring that inhales and exhales, with
-   two ripple halos trailing behind. No rotation and no filled centre, so it
-   reads as "listening" rather than "loading" */
+
 #empty .ring{position:relative;width:76px;height:76px;border-radius:50%;
   box-sizing:border-box;border:2px solid rgba(76,201,240,.6);
   animation:ring-breathe 3.8s ease-in-out infinite}
@@ -127,24 +106,15 @@ main{max-width:1500px;margin:0 auto;width:100%;flex:1;min-height:0;
   #empty .ring,#empty .ring::before,#empty .ring::after{
     animation-duration:6s}
 }
-/* Conversation layout: every utterance is a chat turn aligned to the side of
-   the language it was spoken in - Chinese source on the right, any other
-   source on the left - so the list reads top to bottom as a dialogue. The
-   translation sits inside the same bubble, under a dashed rule, as the half
-   addressed to the other party. */
+
 .turn{position:relative;display:flex;align-items:flex-start;gap:.55rem;
   animation:rise .35s ease both}
-/* row-reverse puts the badge outboard on the left side: the DOM order stays
-   [bubble, badge] for both sides, only the axis flips, so the avatar always
-   ends up on the far edge and the bubble always against it */
+
 .turn.right{justify-content:flex-end}
 .turn.left{flex-direction:row-reverse;justify-content:flex-end}
-/* Consecutive turns from one party read as a single burst: pulled together,
-   with the avatar shown only once at the top of it. */
+
 .turn.left.cont,.turn.right.cont{margin-top:-.35rem}
-/* Named .who rather than .badge: the drawer's "advanced" chip already owns
-   .badge, and sharing the name let its padding/border-radius leak onto every
-   speaker avatar. */
+
 .turn.cont .who{visibility:hidden}
 .who{flex:0 0 auto;width:28px;height:28px;border-radius:50%;display:grid;
   place-items:center;font-size:.6rem;font-weight:600;letter-spacing:.02em;
@@ -160,8 +130,7 @@ main{max-width:1500px;margin:0 auto;width:100%;flex:1;min-height:0;
   border:1px solid var(--border);border-radius:14px;padding:.7rem .9rem .75rem}
 @supports not (backdrop-filter:blur(1px)){.bubble{background:rgba(20,26,44,.85)}}
 @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-/* The squared-off corner points back at the speaker's side, the way a chat
-   bubble tail would. */
+
 .turn.right .bubble{border-bottom-right-radius:4px;
   border-color:rgba(76,201,240,.30);
   background:linear-gradient(135deg,rgba(76,201,240,.15),rgba(76,201,240,.05))}
@@ -178,16 +147,14 @@ main{max-width:1500px;margin:0 auto;width:100%;flex:1;min-height:0;
   border-color:rgba(76,201,240,.32)}
 .turn.left .pill.src{color:#c4b5fd;background:rgba(167,139,250,.13);
   border-color:rgba(167,139,250,.34)}
-/* per-sentence speaker direction, filled in when the segment closes */
+
 .pill.doa{color:#34d399;background:rgba(52,211,153,.09);
   border-color:rgba(52,211,153,.28);display:inline-flex;align-items:center;
   gap:.3em}
 .pill.doa::before{content:"";width:5px;height:5px;border-radius:50%;
   background:currentColor;box-shadow:0 0 6px currentColor}
 .src-text{font-size:1.02rem;line-height:1.55}
-/* the translated half is drawn as a nested block rather than a differently
-   coloured line: it then reads the same on the cyan and on the violet bubble.
-   No border - two nested outlines per turn was visual noise. */
+
 .trans{margin-top:.5rem;padding:.42rem .55rem;border-radius:9px;
   font-size:.95rem;line-height:1.5;color:var(--text);
   background:rgba(0,0,0,.20)}
@@ -198,10 +165,9 @@ main{max-width:1500px;margin:0 auto;width:100%;flex:1;min-height:0;
   vertical-align:-0.15em;background:var(--accent);
   animation:blink 1s steps(1) infinite;border-radius:2px}
 @keyframes blink{0%,55%{opacity:1}56%,100%{opacity:0}}
-/* an explicit display on a class would otherwise beat the UA rule for the
-   hidden attribute, leaving an empty pill's dot on screen */
+
 [hidden]{display:none !important}
-/* drawer */
+
 #mask{position:fixed;inset:0;background:rgba(6,9,18,.45);backdrop-filter:blur(6px);
   -webkit-backdrop-filter:blur(6px);opacity:0;pointer-events:none;transition:opacity .3s;z-index:8}
 #mask.show{opacity:1;pointer-events:auto}
@@ -216,10 +182,7 @@ main{max-width:1500px;margin:0 auto;width:100%;flex:1;min-height:0;
 .section:first-of-type{border-top:0;padding-top:0}
 .section h3{font-size:.74rem;color:var(--text-dim);margin-bottom:.65rem;display:flex;
   align-items:center;gap:.45rem;text-transform:uppercase;letter-spacing:.09em}
-.badge{font-size:.6rem;padding:.08rem .4rem;border-radius:99px;background:rgba(251,146,60,.15);
-  color:#fb923c;border:1px solid rgba(251,146,60,.3);text-transform:none;letter-spacing:0}
-/* language row: a label and its select share one line so the drawer reads as
-   a settings list instead of a stack of full-width controls */
+
 .field{display:flex;align-items:center;gap:.6rem;margin-bottom:.5rem}
 .field label{flex:0 0 5.4em;font-size:.74rem;color:var(--text-dim)}
 .field select{margin:0;flex:1;color-scheme:dark}
@@ -228,13 +191,7 @@ select,input[type=text],input[type=number]{
   background:rgba(255,255,255,.05);border:1px solid var(--border);outline:none;font-size:.85rem;
   transition:border-color .2s, background .2s;
 }
-/* The closed select takes the translucent glass background above, but the open
-   popup replaces it with the UA's own surface. The selected row also gets the
-   UA's highlight, so this rule only has to keep the text legible: the colour
-   must be opaque, because a translucent one composites over whatever surface
-   the popup happens to have - which is how the highlight ended up unreadable
-   (pale cyan over a light popup, under near-white text). Opaque dark wins on
-   both a light and a dark surface. */
+
 select option{background:var(--bg);color:var(--text)}
 select option:checked{background:var(--bg);color:var(--accent)}
 select:hover,input[type=text]:hover,input[type=number]:hover{border-color:rgba(255,255,255,.28)}
@@ -245,11 +202,10 @@ select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--
 .btn:hover{filter:brightness(1.08)}
 .btn:active{transform:scale(.98)}
 .btn.ghost{background:var(--glass-strong);color:var(--text);border:1px solid var(--border)}
-/* the primary action of each section sits right-aligned and sized to content */
+
 .section .actions{display:flex;justify-content:flex-end;gap:.45rem;margin-top:.7rem}
 .section .actions .btn{padding:.42rem .95rem;font-size:.76rem}
-/* zone editor: label plus its azimuth range; a start greater than the end
-   means the range wraps past 360° */
+
 .zrow{display:grid;grid-template-columns:1.2em 1fr 3.6em 3.6em 30px;
   gap:.35rem;align-items:center;margin-bottom:.4rem}
 .zrow .zlabel{min-width:0}
@@ -258,8 +214,7 @@ select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--
 .zrow input[type=text]{text-align:left;font-family:inherit}
 .zrow input[type=number]{text-align:right;font-family:ui-monospace,Consolas,monospace;
   -moz-appearance:textfield;appearance:textfield;color-scheme:dark}
-/* the spinners are unreadable on the dark background, and these fields are
-   typed rather than nudged */
+
 .zrow input[type=number]::-webkit-outer-spin-button,
 .zrow input[type=number]::-webkit-inner-spin-button{
   -webkit-appearance:none;margin:0}
@@ -267,43 +222,12 @@ select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--
   background:transparent;color:var(--text-dim);cursor:pointer;display:grid;place-items:center;
   transition:all .2s}
 .del:hover{color:var(--err);border-color:rgba(248,113,113,.4)}
-#advToggle{width:100%;text-align:left;padding:.55rem .65rem;border-radius:9px;
-  background:var(--glass);border:1px solid var(--border);color:var(--text);
-  cursor:pointer;font-size:.8rem;display:flex;align-items:center;gap:.5rem;
-  transition:background .2s}
-#advToggle:hover{background:var(--glass-strong)}
-#advBody{display:none;margin-top:.6rem}
-#advBody.open{display:block}
-.advgroup{margin-bottom:.6rem;border:1px solid var(--border);border-radius:10px;overflow:hidden}
-.advgroup .ghead{position:relative;padding:.5rem .65rem;background:var(--glass-strong);
-  font-size:.72rem;color:var(--text);cursor:pointer;display:flex;
-  justify-content:space-between;align-items:center;gap:.5rem}
-.advgroup .gbody{display:none;padding:.5rem .65rem}
-.advgroup.open .gbody{display:block}
-.cmd{display:flex;gap:.45rem;align-items:center;padding:.32rem 0;font-size:.72rem;
-  font-family:ui-monospace,Consolas,monospace}
-.cmd .cname{flex:1;color:var(--text);overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap}
-.cmd .val{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-  color:var(--accent);font-size:.64rem}
-.cmd .ro{font-size:.58rem;color:var(--text-dim)}
-/* deliberately unavailable commands (flash persist / device reset) */
-.cmd .ralert{font-size:.58rem;color:#fb923c;border:1px solid rgba(251,146,60,.35);
-  background:rgba(251,146,60,.12);border-radius:99px;padding:.06rem .38rem;
-  white-space:nowrap;cursor:help}
-.cmd input:disabled{opacity:.35;cursor:not-allowed}
-.cmd input{width:110px;padding:.28rem .4rem;margin:0;border-radius:6px;font-size:.68rem}
 .mini{padding:.28rem .55rem;border:none;border-radius:6px;cursor:pointer;font-size:.66rem;
   background:rgba(255,255,255,.1);color:var(--text);transition:background .2s}
 .mini:hover{background:rgba(255,255,255,.2)}
 .mini.icon{width:24px;padding:.28rem 0;display:grid;place-items:center;font-size:.8rem;
   line-height:1}
-/* Fully invisible at rest, not merely translated out of the way. The old rule
-   offset the box by 150% of its own height, which is short of the 2rem gap it
-   also had to clear - so a rounded sliver stayed on screen at bottom centre,
-   reading as an unexplained ellipse. visibility + opacity makes "hidden"
-   independent of that arithmetic. It floats above the list's bottom padding
-   rather than over the newest card. */
+
 #toast{position:fixed;left:50%;bottom:1.25rem;transform:translate(-50%,1rem);
   z-index:12;max-width:78vw;padding:.6rem 1.1rem;border-radius:10px;font-size:.82rem;
   background:rgba(15,20,36,.95);border:1px solid var(--border);color:var(--text);
@@ -315,8 +239,6 @@ select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--
 #toast.info{border-color:rgba(96,165,250,.5)}
 @media(max-width:520px){
   main{padding:.9rem .8rem 4.5rem}
-  /* at 80% the two sides nearly meet on a phone and the split stops reading
-     as two parties, so the bubbles give up width to the centre gutter */
   .bubble{max-width:72%}
   .who{width:24px;height:24px;font-size:.54rem}
   #drawer{width:94vw}
@@ -370,12 +292,6 @@ select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--
     <div id="zones"></div>
     <div class="actions"><button class="btn ghost" id="saveZones">保存标签</button></div>
   </div>
-
-  <div class="section">
-    <h3>高级 <span class="badge">设备参数</span></h3>
-    <button id="advToggle">▸ USB 命令</button>
-    <div id="advBody"></div>
-  </div>
 </aside>
 <div id="toast"></div>
 <script>
@@ -385,15 +301,9 @@ const $ = id => document.getElementById(id);
 const stream = $("stream"), empty = $("empty");
 const cards = new Map();          // id -> turn element
 const MAX_CARDS = 50;
-// mirror of the drawer's language settings, so a bubble can label its two
-// halves with the pair actually in force rather than a hard-coded one
 let langLabels = {};
 let targets = {zh_to: "en", other_to: "zh"};
 
-// Client-side twin of asr.detect_language, used only to align a *streaming*
-// card: the backend has not sent `lang` yet while the partial is arriving, and
-// waiting for the final to pick a side would visibly flip the bubble across
-// the screen. Kana/hangul win over ideographs for the same reason as there.
 function guessSide(text){
   if (/[\u3040-\u30ff\u31f0-\u31ff]/.test(text)) return "left";
   if (/[\uac00-\ud7af\u1100-\u11ff]/.test(text)) return "left";
@@ -404,15 +314,9 @@ function setSide(el, side){
   el.classList.toggle("right", side === "right");
   el.classList.toggle("left", side !== "right");
   const b = el.querySelector(".who");
-  // the badge is the standing label of who is talking; the pill above the
-  // text only names the language pair for that particular sentence
   if (b) b.textContent = side === "right" ? "中" : "外";
   refreshRuns();
 }
-// Mark every turn that continues the previous speaker, so a burst from one
-// side tightens up and shows its badge only once. Recomputed rather than
-// tracked incrementally: a removed or re-sided card can change the run
-// boundaries of its neighbours too.
 function refreshRuns(){
   let prev = null;
   for (const t of stream.querySelectorAll(".turn")){
@@ -434,18 +338,11 @@ function toast(msg, kind){
   t._timer = setTimeout(() => t.className = "", 2600);
 }
 function nearBottom(){
-  // measured on the list element, not on the document: the list is what
-  // scrolls, and this stays correct whichever element a browser picks as the
-  // scrolling one.
   return stream.scrollHeight - stream.scrollTop - stream.clientHeight <= 80;
 }
 function scrollIfStuck(){
-  // Someone who scrolled back up to re-read must not be yanked down by the
-  // next partial, so only follow when already at the end.
   if (!nearBottom()) return;
   const gap = stream.scrollHeight - stream.scrollTop - stream.clientHeight;
-  // A smooth scroll restarted on every partial (~480ms apart) never finishes
-  // its animation and reads as jitter; short distances are jumped instead.
   stream.scrollTo({top: stream.scrollHeight,
                    behavior: gap > 24 ? "smooth" : "auto"});
 }
@@ -456,9 +353,6 @@ function cardFor(id, partial){
     let el = cards.get(id);
   if (!el){
     el = document.createElement("div");
-    // A chat turn: the wrapper carries the side, the bubble the styling. A
-    // partial arrives before the backend has judged the language, so it starts
-    // on the left and moves once there is text to look at.
     el.className = "turn left";
     el.innerHTML =
       '<div class="bubble">' +
@@ -491,11 +385,6 @@ function stampDoa(el, doa){
   p.title = "说话人方位：" + doa;
   p.hidden = false;
 }
-
-// freezeCard: the utterance is complete - drop the blinking cursor, settle the
-// turn onto its speaker's side, and make sure the translation slot shows the
-// pending placeholder. Called for the 2-pass final result, which replaces
-// pass-1 streaming text in one shot.
 function freezeCard(el, lang){
   const cur = el.querySelector(".cursor");
   if (cur) cur.remove();
@@ -504,8 +393,6 @@ function freezeCard(el, lang){
     trans.className = "trans pending";
     trans.textContent = "翻译中…";
   }
-  // right = Chinese speaker, left = everybody else: the alignment itself says
-  // which direction this turn is going, so the pill only names the pair
   setSide(el, lang === "zh" ? "right" : "left");
   const tgt = lang === "zh" ? targets.zh_to : targets.other_to;
   const pill = el.querySelector(".pill.src");
@@ -535,10 +422,6 @@ function handle(msg){
     }
     case "partial": {
       removeEmpty();
-      // 2-pass pass 1: paint the streaming text the instant it arrives.
-      // The backend sends the *cumulative* transcript, so each message
-      // replaces the whole line - there is no append and no reveal
-      // animation, the card simply grows by one decode step.
       const el = cardFor(msg.id, true);
       el.querySelector(".src-text").textContent = msg.text || "";
       setSide(el, guessSide(msg.text || ""));
@@ -562,8 +445,6 @@ function handle(msg){
       break;
     }
     case "vad.state": {
-      // a small level meter instead of the "and · 静" text: silence shows a
-      // dim resting bar, speech lifts the bars and tints them.
       const g = $("gate");
       const active = msg.segment_state === "SPEAKING" || !!msg.hw_vad;
       g.classList.toggle("on", active);
@@ -580,28 +461,10 @@ function handle(msg){
 function sendCmd(cmd, payload){
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({cmd, payload}));
 }
-function onCmdResult(msg){
-  if (msg.ok === false){ toast(msg.error || "failed", "err"); return; }
-  // read results: backfill the value next to the command row
-  if (msg.data && msg.data.name && msg.data.value !== undefined){
-    const row = document.querySelector(
-      '.cmd[data-await-name="' + CSS.escape(msg.data.name) + '"]');
-    if (row){
-      const val = row.querySelector(".val");
-      if (val){
-        val.textContent = JSON.stringify(msg.data.value);
-        val.title = JSON.stringify(msg.data.value);
-      }
-    }
-    toast("读取 " + msg.data.name + " 成功", "ok");
-  }
-}
 
 function langName(code){
   return langLabels[code] || code || "?";
 }
-// the legend is the standing reminder of which side is which; its targets
-// follow the drawer, so it never claims a direction that is not in force
 function paintLegend(){
   $("lgRight").innerHTML = '<i class="lgh"></i>' +
     esc("中文 → " + langName(targets.zh_to));
@@ -652,8 +515,6 @@ function renderZones(data){
     (typeof z === "object" && z !== null)
       ? {label: String(z.label ?? ""), start: Number(z.start) || 0, end: Number(z.end) || 0}
       : {label: String(z), start: 0, end: 0});
-  // a bare-label payload carries no ranges; spread them evenly rather than
-  // stacking every row on 0-0
   if (zones.length && zones.every(z => z.start === 0 && z.end === 0)){
     const step = 360 / zones.length;
     zones.forEach((z, i) => {
@@ -662,56 +523,6 @@ function renderZones(data){
     });
   }
   zones.forEach((z, i) => box.appendChild(zoneRow(z, i + 1)));
-}
-function renderCommandGroups(data){
-  const body = $("advBody");
-  body.innerHTML = "";
-  Object.entries(data.groups || {}).forEach(([resid, cmds]) => {
-    const g = document.createElement("div");
-    g.className = "advgroup";
-    const head = document.createElement("div");
-    head.className = "ghead";
-    head.innerHTML = "<span>" + esc(resid) + "</span><span>" + cmds.length + "</span>";
-    const gbody = document.createElement("div");
-    gbody.className = "gbody";
-    cmds.forEach(c => {
-      const row = document.createElement("div");
-      row.className = "cmd";
-      // Commands that persist the configuration to flash, or reset the
-      // device, are shown but not writable here: the backend refuses them
-      // anyway, and the reason belongs next to the control.
-      const blocked = (c.access === "wo") || !!c.blocked;
-      row.innerHTML = '<span class="cname">' + esc(c.name) + "</span>" +
-        (c.blocked ? '<span class="ralert" title="' + esc(c.block_reason || "") +
-            '">不可用</span>' : "") +
-        '<span class="val"></span>' +
-        (c.access === "ro" ? '<span class="ro">ro</span>' :
-          '<input type="text" placeholder="json"' +
-            (blocked ? " disabled" : "") + ">") +
-        '<button class="mini read">读</button>' +
-        (c.access === "rw" && !c.blocked ?
-          '<button class="mini write">写</button>' : "");
-      const rd = row.querySelector(".read");
-      // a write-only command has nothing to read; hide it rather than let
-      // the click fail
-      if (c.access === "wo"){ rd.remove(); }
-      else rd.onclick = () => {
-        sendCmd("read", {name: c.name});
-        row.dataset.awaitName = c.name;
-      };
-      const w = row.querySelector(".write");
-      if (w) w.onclick = () => {
-        const raw = row.querySelector("input").value.trim();
-        if (!raw){ toast("需要 JSON 值", "err"); return; }
-        try { sendCmd("write", {name: c.name, value: JSON.parse(raw)}); }
-        catch(e){ toast("非法 JSON: " + e.message, "err"); }
-      };
-      gbody.appendChild(row);
-    });
-    head.onclick = () => g.classList.toggle("open");
-    g.appendChild(head); g.appendChild(gbody);
-    body.appendChild(g);
-  });
 }
 
 function connect(){
@@ -722,15 +533,12 @@ function connect(){
     reconnectDelay = 500;
     sendCmd("get_target_langs");
     sendCmd("get_zones");
-    sendCmd("list_commands");
   };
   ws.onmessage = e => {
     let m; try { m = JSON.parse(e.data); } catch(err){ return; }
     if (m.type === "cmd_result"){
-      onCmdResult(m);
       if (m.data && m.data.options) renderTargets(m.data);
       if (m.data && m.data.zones) renderZones(m.data);
-      if (m.data && m.data.groups) renderCommandGroups(m.data);
       return;
     }
     handle(m);
@@ -743,7 +551,6 @@ function connect(){
   ws.onerror = () => ws.close();
 }
 
-/* drawer interactions */
 const drawer = $("drawer"), mask = $("mask");
 function openDrawer(){ drawer.classList.add("show"); mask.classList.add("show"); }
 function closeDrawer(){ drawer.classList.remove("show"); mask.classList.remove("show"); }
@@ -751,16 +558,7 @@ $("gear").onclick = () => drawer.classList.contains("show") ? closeDrawer() : op
 mask.onclick = closeDrawer;
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
 
-// The drawer's promise is "runtime config takes effect immediately", so the
-// selects apply on change instead of waiting for the button. That mattered:
-// the <select> keeps its own selection, so picking "Japanese" *looked* applied
-// while the backend was still on the default zh_to="en" and kept translating
-// to English until the button was pressed. The button stays as an explicit
-// affordance but is no longer the only way to commit.
 function commitLangs(){
-  // set_target_langs answers with the pair alone (no options map), so the
-  // local mirror is updated here rather than waiting for the next
-  // get_target_langs reply
   targets = {zh_to: $("zhTo").value, other_to: $("otherTo").value};
   paintLegend();
   sendCmd("set_target_langs", targets);
@@ -773,7 +571,6 @@ $("saveLangs").onclick = () => {
 };
 $("addZone").onclick = () => {
   const n = document.querySelectorAll("#zones .zrow").length;
-  // a new row claims no degrees until the user fills in a range
   $("zones").appendChild(zoneRow({label: "", start: 0, end: 0}, n + 1));
 };
 $("saveZones").onclick = () => {
@@ -781,12 +578,6 @@ $("saveZones").onclick = () => {
   if (!zones.length){ toast("至少需要一个方位标签", "err"); return; }
   sendCmd("set_zones", {zones});
   toast("方位标签已保存", "ok");
-};
-$("advToggle").onclick = () => {
-  const b = $("advBody");
-  b.classList.toggle("open");
-  $("advToggle").textContent =
-    (b.classList.contains("open") ? "▾ " : "▸ ") + "USB 命令";
 };
 
 connect();

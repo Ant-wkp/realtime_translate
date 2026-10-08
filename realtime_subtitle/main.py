@@ -24,10 +24,6 @@ import time
 
 import numpy as np
 
-# Support both "python -m realtime_subtitle.main" and "python main.py":
-# when executed as a script there is no package context, so inject the
-# repo root into sys.path and register the package name before any
-# relative import below runs.
 if __package__ is None or __package__ == "":
     _pkg_dir = os.path.dirname(os.path.abspath(__file__))
     _repo_root = os.path.dirname(_pkg_dir)
@@ -44,14 +40,8 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 SAMPLE_RATE = 16000
 
-# default segmentation parameters
 VAD_INTERVAL = 0.1          # main loop tick, seconds
 SILENCE_HOLD = 0.6          # trailing silence before flush
-# Shortest valid segment, measured as *voiced* time. This number has to be
-# interpreted against real speech only: the trailing-silence hold runs for a
-# full silence_hold and used to be counted into duration, which inflated every
-# segment by ~0.6s and let the filter pass near-silence. With duration now
-# honest, 0.5 would reject ordinary two-character replies, so it is 0.3.
 MIN_SECONDS = 0.3
 MAX_SECONDS = 20.0          # force-cut overlong segments
 PRE_ROLL_DEFAULT = 1.0      # ring-buffer window retained before segment start
@@ -61,7 +51,7 @@ SHORT_EXEMPT_MAX_PROB = 0.5 # peak probability required for exemption
 RATIO_THRESHOLD = 0.35      # segment speech-frame ratio floor
 TRIM_TAIL_ENERGY = 1e-4     # RMS below which tail frames are trimmed
 
-
+ARRAY_DEVICE_NAMES = ("respeaker xvf3800", "xvf3800", "respeaker")
 class VadDoaReader(threading.Thread):
     """Poll DOA_VALUE (angle + speech activity) off the control plane.
 
@@ -286,10 +276,7 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-# name fragments that identify the array across platforms. The XVF3800 shows
-# up as "reSpeaker XVF3800" under PipeWire/Pulse and as the ALSA card name on a
-# host without a sound server, so the match is a list rather than one string.
-ARRAY_DEVICE_NAMES = ("respeaker xvf3800", "xvf3800", "respeaker")
+
 
 
 def resolve_input_device(name: str | None) -> int:
@@ -302,19 +289,15 @@ def resolve_input_device(name: str | None) -> int:
         for d in devs:
             if name.lower() in d["name"].lower():
                 return d["index"]
-        # List what does exist: on a new host the ALSA naming is unpredictable
-        # and "input device not found: x" alone gives nothing to search for.
         listing = "\n".join(f"  [{d['index']}] {d['name']} "
                             f"({d['max_input_channels']} ch)" for d in devs)
         raise RuntimeError(
             f"input device not found: {name}\n"
             f"available input devices:\n{listing or '  (none)'}"
         )
-    # auto-detect the reSpeaker XVF3800 audio interface
     for d in devs:
         if any(frag in d["name"].lower() for frag in ARRAY_DEVICE_NAMES):
             return d["index"]
-    # hardware not found: fall back to the default device but say so
     default = sd.default.device[0]
     fallback_name = "default"
     for d in devs:
@@ -327,13 +310,6 @@ def resolve_input_device(name: str | None) -> int:
 
 
 def resolve_audio_channel(args, in_channels: int) -> tuple[int, str]:
-    """Pick the capture channel.
-
-    Only the two processed outputs are offered by name because those are the
-    only ones with different DSP chains behind them; anything else is reached
-    with --ch. The array's four raw microphones sit on channels 2-5 and are
-    fixed per-microphone, so naming them added no capability over the index.
-    """
     if args.ch is not None:
         return args.ch, f"ch{args.ch + 1} (explicit)"
     mapping = {"conference": 0, "asr": 1}
@@ -361,21 +337,15 @@ def main(argv=None) -> int:
     if args.list_devices:
         print(sd.query_devices())
         return 0
-
-    # ---- device control plane (optional for audio-only runs) ----------
     device = None
     try:
         from .usb_device import ReSpeaker
 
         device = ReSpeaker()
         print("[USB] XVF3800 control plane connected")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"[USB] control plane unavailable: {exc}")
     if device is None and not args.no_hw_vad:
-        # Without the control plane the hardware speech flag is pinned to 0
-        # and the gate can never open: the program still starts, prints its
-        # banner and then produces nothing at all. An explicit instruction is
-        # better than that silence.
         print("[USB] WARNING: no hardware VAD - the gate is hardware AND "
               "software, so nothing will be recognized. Re-run with "
               "--no-hw-vad to gate on the software VAD alone.")
@@ -385,9 +355,6 @@ def main(argv=None) -> int:
     dev_info = sd.query_devices(input_device, "input")
     in_channels = args.in_channels or dev_info["max_input_channels"]
     ch_index, ch_desc = resolve_audio_channel(args, in_channels)
-    # Validate before the stream opens: the index is consumed inside the
-    # PortAudio callback, where an IndexError surfaces on a foreign thread as
-    # an unhandled callback exception rather than a usable message.
     if not 0 <= ch_index < in_channels:
         raise SystemExit(
             f"--ch {ch_index} is out of range for '{dev_info['name']}' "
@@ -402,11 +369,6 @@ def main(argv=None) -> int:
 
     locator = SpeakerLocator()
 
-    # ---- inference providers --------------------------------------------
-    # Streaming 2-pass is the only mode: partials are what make subtitles feel
-    # live, and the offline pass already runs for the final text, so an opt-out
-    # would only remove the intermediate result without changing what the
-    # recognizer hears.
     from .funasr_provider import FunasrProvider
 
     chunk = (FunasrProvider.CHUNK_SIZE_480 if args.asr_chunk_size == "480"
@@ -436,19 +398,15 @@ def main(argv=None) -> int:
 
     server = BroadcastServer(host=args.host, port=args.port)
     server.start()
-    control = ControlHandler(device, locator, translator)
+    control = ControlHandler(locator, translator)
     print(f"[WS] subtitle service: http://{args.host}:{args.port}/ "
           f"(from another machine use this host's IP)")
 
-    # per-segment timing anchors for end-to-end latency stats
     speech_end_at: dict[str, float] = {}
     seg_durations: dict[str, float] = {}
-    # first-character latency: segment open -> first non-empty partial
     seg_open_at: dict[str, float] = {}
     seg_seed_secs: dict[str, float] = {}
     first_char_logged: set[str] = set()
-    # rolling stats for the [首字] line; guarded because on_partial runs on
-    # the transcriber worker while flush runs on the main loop
     first_char_stats = {"n": 0, "sum": 0.0, "miss": 0}
     first_char_lock = threading.Lock()
 
@@ -462,10 +420,6 @@ def main(argv=None) -> int:
         result_queue.put(result)
 
     def on_partial(stream_id, text):
-        # first-character latency: first non-empty partial after the segment
-        # opened. This is the number the pre-roll seed is meant to shrink -
-        # the [耗时] line measures "after speech ended", which is a different
-        # (and unchanged) quantity.
         if text:
             with first_char_lock:
                 if stream_id not in first_char_logged:
@@ -490,9 +444,6 @@ def main(argv=None) -> int:
     final_decode.start()
 
     def on_final_request(req):
-        # trim trailing silence before the offline re-decode: hold-period
-        # ticks feed quiet audio into the stream, and silence tails both
-        # slow the decode and seed phantom punctuation
         audio = (trim_tail(req.audio, TRIM_TAIL_ENERGY)
                  if req.audio is not None and req.audio.size else req.audio)
         final_decode.submit(req.task_id, audio, doa=req.doa,
@@ -507,11 +458,6 @@ def main(argv=None) -> int:
     if device is not None:
         vad_reader = VadDoaReader(device, interval=args.vad_interval)
         vad_reader.start()
-
-    # ---- segmentation state machine ---------------------------------
-    # All of the per-segment bookkeeping (gate, pre-roll ring, silence hold,
-    # flush filters) lives in Segmenter so that this loop stays a transaction:
-    # drain, feed, act on the returned Actions. See segmenter.py.
     seg_cfg = SegmentCfg(min_seconds=args.min_seconds,
                          max_seconds=args.max_seconds,
                          silence_hold=args.silence_hold,
@@ -528,43 +474,22 @@ def main(argv=None) -> int:
 
     def audio_callback(indata, frames, time_info, status):
         if status:
-            pass  # overflow flags are tolerated; queue drops are the backpressure
+            pass
         audio_queue.put(indata[:, ch_index].copy())
 
     def gate_verdict(sw_prob: float) -> bool:
-        """Hardware speech flag AND software VAD.
-
-        Both operands are needed rather than either alone: the firmware flag is
-        an energy gate that opens on any loud sound, while Silero is a model
-        that can be talked into a false positive by steady noise. Requiring
-        both keeps a doorbell out of the segmenter, and the segmenter's own
-        ratio filter then re-checks the same probability at flush time.
-
-        With --no-hw-vad the hardware operand is dropped rather than
-        satisfied artificially: that flag is pinned to 0 whenever the control
-        plane is unavailable, so keeping it in the expression would gate out
-        every segment.
-        """
         if args.no_hw_vad:
             return sw_prob >= SW_FRAME_THRESHOLD
         return hw_vad == 1 and sw_prob >= SW_FRAME_THRESHOLD
 
     def apply_actions(actions):
-        """Translate Segmenter Actions into calls on the rest of the system.
-
-        The segmenter is pure logic and returns data; every side effect lives
-        here, in the order the inline loop used to print them.
-        """
         for act in actions:
-            # diagnostics first, in the order the inline loop printed them
             if act.flush_line:
                 print(act.flush_line)
             if act.debug_line:
                 print(act.debug_line)
             if act.kind == "open":
                 seg_open_at[act.seg_id] = time.monotonic()
-                # start a fresh DOA tally: the reported direction must
-                # describe this utterance; flush reads it back via locator.mode()
                 locator.reset()
                 seg_seed_secs[act.seg_id] = act.seed_secs
                 transcriber.stream_start(act.seg_id)
@@ -594,18 +519,10 @@ def main(argv=None) -> int:
                 else:
                     transcriber.submit(act.audio, task_id=seg_id,
                                        doa=locator.mode())
-                # Timing anchors are only meaningful for segments that
-                # actually reach ASR. A rejected segment already aborted its
-                # stream and told the frontend to drop the card, so recording
-                # anchors here would leak entries that no result will pop.
                 speech_end_at[seg_id] = time.monotonic()
                 seg_durations[seg_id] = act.seg_seconds
                 seg_open_at.pop(seg_id, None)
                 seg_seed_secs.pop(seg_id, None)
-                # a flushed segment that never produced a partial is the
-                # short-utterance case: the stride means one-chunk sentences
-                # decode only at finish. Counted so the summary reports
-                # coverage instead of silently omitting them.
                 if seg_id not in first_char_logged:
                     first_char_stats["miss"] += 1
                 first_char_logged.discard(seg_id)
@@ -615,10 +532,6 @@ def main(argv=None) -> int:
             device=input_device, channels=in_channels,
             samplerate=SAMPLE_RATE, dtype="float32", callback=audio_callback,
         ):
-            # `timeout` (and any supervisor) sends SIGTERM, which as a plain
-            # exception would skip the finally block entirely and leave the
-            # websocket port bound. Converting the signal into
-            # KeyboardInterrupt routes it through the same cleanup path.
             import signal
 
             def _on_term(_signum, _frame):
@@ -634,7 +547,7 @@ def main(argv=None) -> int:
             while True:
                 now = time.time()
 
-                # 3) drain hw VAD / DOA
+
                 hw_vad = 0
                 while True:
                     try:
@@ -648,12 +561,6 @@ def main(argv=None) -> int:
                         doa_last = snap["doa"]
                         if segmenter.active:
                             locator.observe(doa_last)
-
-                # 4) feed the segmenter and act on the Actions it returns.
-                # The loop stays single-threaded on purpose: segmentation
-                # driven from another thread would race on the shared
-                # telemetry and lose the 100 ms tick semantics that the
-                # timing numbers depend on.
                 chunks = []
                 while True:
                     try:
@@ -672,7 +579,6 @@ def main(argv=None) -> int:
 
                 apply_actions(actions)
 
-                # 5) frontend commands
                 while True:
                     try:
                         msg = server.cmd_queue.get_nowait()
@@ -685,7 +591,6 @@ def main(argv=None) -> int:
                             "ts": time.time(), **resp,
                         })
 
-                # 6) drain ASR results
                 while True:
                     try:
                         result = result_queue.get_nowait()
@@ -693,17 +598,9 @@ def main(argv=None) -> int:
                         break
                     task_id = result.meta.get("task_id", "")
                     is_final = bool(result.meta.get("final_replaces_partial"))
-                    # Timing anchors are single-use: pop them as soon as the
-                    # segment's result shows up, whichever branch handles it,
-                    # so nothing accumulates for discarded or empty segments.
                     speech_end = speech_end_at.pop(task_id, None) if is_final else None
                     seg_len = seg_durations.pop(task_id, None) if is_final else None
                     if not result.text:
-                        # Nothing usable came out of this utterance. A card
-                        # only exists if a partial was already broadcast for
-                        # this id, and silently skipping would leave that card
-                        # on screen with its cursor blinking and no translation
-                        # ever arriving - so tell the frontend to drop it.
                         if is_final:
                             server.broadcast({"type": "discard", "id": task_id,
                                               "ts": time.time()})
@@ -712,18 +609,11 @@ def main(argv=None) -> int:
                           f"mode={result.meta.get('mode', '')} "
                           f"decode={result.latency * 1000:.0f}ms "
                           f"text={result.text[:40]!r}")
-                    # terminal-only latency stat (old-version format): the
-                    # final text replacing the partial marks "source on
-                    # screen" for this utterance
                     if is_final and speech_end is not None:
                         src_e2e = time.monotonic() - speech_end
                         seg_txt = f" (段时长 {seg_len:.2f}s)" if seg_len else ""
                         print(f"[耗时] {task_id[:8]} 说完→原文上屏: "
                               f"{src_e2e:.2f}s{seg_txt}")
-                    # The ASR engine's own `language` field describes what it
-                    # emits (FunASR always reports "zh"), not what it heard, so
-                    # the card label and the translation direction are both
-                    # derived from the recognized text instead.
                     lang = detect_language(result.text)
                     server.broadcast({
                         "type": "final" if is_final else "source",
@@ -735,7 +625,6 @@ def main(argv=None) -> int:
                     })
                     translation.submit(task_id, result.text, lang)
 
-                # heartbeat broadcast
                 server.broadcast({
                     "type": "vad.state",
                     "hw_vad": hw_vad,

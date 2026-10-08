@@ -103,7 +103,7 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 
 不加 `--ch` 时只看 `--audio-source`；`--ch` 优先于它。四路原始麦克风是固定的每麦一路，再给它们起名字不比索引多出能力。
 
-波束（转向/路由）**不再由程序配置**，理由和实测数据见 [ARCHITECTURE.md](ARCHITECTURE.md) §8。需要时可在前端「USB 命令」面板手动读写，会写 flash 的命令被 `usb_device.py` 拦住。
+波束（转向/路由）**不再由程序配置**，理由和实测数据见 [ARCHITECTURE.md](ARCHITECTURE.md) §8。该能力**不再有任何界面入口**：前端「USB 命令」面板与其后端命令已移除；设备层的 `usb_device.read()/write()` 与 flash 守卫仍保留，供将来需要时使用。
 
 详细设计见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 

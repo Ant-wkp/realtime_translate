@@ -83,10 +83,12 @@ flush 段(id) ──→ TranscriberWorker ──→ source(id) 立即广播
       translation{id,ts,text,target_lang}
       vad.state{hw_vad,sw_prob,gate_mode,segment_state}
       cmd_result{ok,data|error}
-入站  cmd: list_commands / read / write / get_target_langs / set_target_langs / get_zones / set_zones
+入站  cmd: get_target_langs / set_target_langs / get_zones / set_zones
 ```
 
 `translation` 只带 `id`——它按 id 归属，前端已在卡片上保留该 id。
+
+设备参数命令（`list_commands`/`read`/`write`）已随前端「USB 命令」面板一并移除：本项目不再提供任何界面上的参数读写入口（见 §8）。
 
 延迟测量只留在后端终端（`[首字]` / `[耗时]` 行 + 退出汇总），前端是纯渲染器，不接收任何 latency 字段。
 
@@ -97,6 +99,8 @@ flush 段(id) ──→ TranscriberWorker ──→ source(id) 立即广播
 顶部门控柱是四根 `#gate i`，由 `vad.state` 的 `hw_vad`/`segment_state` 驱动，`title` 显示门控模式。卡片 `.meta` 有 `partial` 与方位两个 pill，方位在段结束时才填。
 
 文本一律经 `esc()` 转义：Zone 标签是**用户可编辑的自由文本**，是真实注入面（已用标记载荷实测：渲染为字面文本、不创建元素）。
+
+设置抽屉只剩两组：翻译方向（改动即生效并持久化，见 §7.2）与 DOA 方位标签。「高级 / 设备参数」区块（USB 命令列表、读/写按钮）已移除，前端不再发送任何设备参数命令。
 
 ## 7. 延迟预算（基线）
 
@@ -160,7 +164,9 @@ GPU 上试过三种量化类型，**`float16` 是唯一在真实运行条件下�
 
 设备有 2 个可编程固定波束（beam1/beam2，`AEC_FIXEDBEAM*`），另有 free-running 与 auto-select 两个由固件派生。程序**不再**在启动时转向或改路由：目标场景是"噪声里稳定识别一个人"，而固件默认输出（`AUDIO_MGR_OP_ALL` 出厂配置，L=处理输出、R=ASR 波束输出）本身就在做这件事。用软件重配会引入必须回滚的设备状态，却没换来识别质量。
 
-因此启动流程不再写设备任何参数；波束相关的读写只在**前端「USB 命令」面板**里按需手动执行（只读命令随时可读；会进 flash 的命令被 `usb_device.py` 的守卫拦住，见 §8.2）。
+因此启动流程不再写设备任何参数。波束相关的读写**再无任何界面入口**：前端「USB 命令」面板已随 `control.py` 的 `list_commands`/`read`/`write` 一并移除（理由同上——这段能力没有换来识别质量，却要带着一套必须回滚的设备状态）。
+
+> 设备层能力未被删除：`usb_device.py` 的 `read()`/`write()` 与守卫仍在，§8.1 的结论也仍然有效，那是将来若要重新启用波束的起点；只是当前没有任何调用方。
 
 ### 8.1 实测结论（firmware 2.0.8）
 
@@ -187,9 +193,11 @@ GPU 上试过三种量化类型，**`float16` 是唯一在真实运行条件下�
 |---|---|---|
 | `FLASH_PERSIST_CMDS` | 会写 flash（`SAVE_CONFIGURATION`/`CLEAR_CONFIGURATION`） | `write` 抛 `PermissionError`，除非显式 `allow_persist=True` |
 | `DISRUPTIVE_CMDS` | 会重启或改 USB 链路（`REBOOT`/`USB_BIT_DEPTH`/`TEST_CORE_BURN`） | 同上 |
-| `GUARDED_CMDS` | 以上两者的并集 | 前端命令面板标记 `blocked` + `block_reason` |
+| `GUARDED_CMDS` | 以上两者的并集 | `write()` 据此抛出；两个子集决定错误措辞 |
 
 本项目**从不持久化**：`AEC_FIXEDBEAMSONOFF` 写进固件后保存可能导致重启挂起，所以任何路径都拦得住。
+
+注：本节以前述及前端命令面板会展示 `blocked`/`block_reason` 标记，随该面板一并移除；守卫本身保留在 `usb_device.py`，现在没有程序内调用方。
 
 ### 8.3 采集通道
 

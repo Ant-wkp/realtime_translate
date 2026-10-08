@@ -40,15 +40,6 @@ STATUS_RETRY = 64
 RETRY_LIMIT = 100
 RETRY_DELAY = 0.01
 
-# resid -> servicer group, for the control API listing
-RESID_GROUPS = {
-    48: "application",
-    33: "aec",
-    35: "audio_mgr",
-    20: "gpo",
-    17: "post_processing",
-}
-
 _TYPE_SIZE = {"uint8": 1, "char": 1, "uint16": 2,
               "uint32": 4, "int32": 4, "float": 4, "radians": 4}
 _FMT = {"uint8": "B", "uint16": "H", "uint32": "I",

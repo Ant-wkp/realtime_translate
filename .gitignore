@@ -4,3 +4,5 @@ __pycache__/
 models/
 speaker_profile.json
 *.onnx
+# runtime user settings (translation direction), written by translator.py
+runtime_settings.json
