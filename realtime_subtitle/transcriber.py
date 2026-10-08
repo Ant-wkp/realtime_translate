@@ -1,21 +1,11 @@
-"""Transcription worker: serial ASR queue decoupled from the main loop.
-
-submit() from the 100 ms main loop is always a cheap queue put. A daemon
-worker consumes segments one at a time (naturally order-preserving), a
-failed segment never blocks the rest of the queue, and results carry the
-same task id the flush state machine stamped so downstream translation and
-the frontend can merge by id.
-"""
 
 from __future__ import annotations
 
 import queue
 import threading
-import time
 from dataclasses import dataclass, field
 
 from .asr import AsrProvider, AsrResult
-
 
 @dataclass
 class Task:
@@ -23,24 +13,16 @@ class Task:
     task_id: str
     doa: str = ""
     stream_id: str | None = None
-    kind: str = "transcribe"  # transcribe | finish | abort
+    kind: str = "transcribe"
     meta: dict = field(default_factory=dict)
-
 
 @dataclass
 class FinalRequest:
-    """Closed utterance awaiting the offline second-pass re-decode.
-
-    Produced by the streaming worker (online tail is already broadcast);
-    consumed by FinalDecodeThread so the multi-second offline decode never
-    blocks the next utterance's streaming feed queue.
-    """
     task_id: str
     stream_id: str
     audio: object
     partial_hint: str = ""
     doa: str = ""
-
 
 class TranscriberWorker(threading.Thread):
     def __init__(self, provider: AsrProvider, on_result=None, on_partial=None,
@@ -53,7 +35,6 @@ class TranscriberWorker(threading.Thread):
         self._task_queue: queue.Queue = queue.Queue()
         self._stop_evt = threading.Event()
 
-    # -- called from the main loop (cheap) -----------------------------
     def submit(self, audio, task_id: str, doa: str = "", stream_id: str | None = None,
                meta: dict | None = None) -> None:
         self._task_queue.put(
@@ -62,7 +43,6 @@ class TranscriberWorker(threading.Thread):
         )
 
     def stream_start(self, stream_id: str) -> None:
-        """Open a streaming utterance session on the worker thread."""
         self._task_queue.put(
             Task(audio=None, task_id=stream_id, kind="start", stream_id=stream_id)
         )
@@ -86,7 +66,6 @@ class TranscriberWorker(threading.Thread):
     def stop(self) -> None:
         self._stop_evt.set()
 
-    # -- worker thread ---------------------------------------------------
     def run(self) -> None:
         while not self._stop_evt.is_set():
             try:
@@ -110,9 +89,6 @@ class TranscriberWorker(threading.Thread):
                     self.on_partial(task.stream_id, partial)
                 return
             if task.kind == "finish":
-                # online tail only: broadcast the last partial immediately,
-                # then hand the audio to the offline re-decode thread so the
-                # next utterance's feeds are never blocked by a 1s+ decode
                 if hasattr(self.provider, "finish_online"):
                     partial, audio = self.provider.finish_online(task.stream_id)
                     if partial and self.on_partial:

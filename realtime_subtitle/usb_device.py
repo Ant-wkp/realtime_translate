@@ -1,26 +1,3 @@
-"""XVF3800 USB control plane: vendor transfers for VAD, DOA and parameters.
-
-Device: Seeed reSpeaker XVF3800 4-Mic Array, VID 0x2886 / PID 0x001A.
-Control uses vendor-specific control transfers on endpoint 0 (the XVF3800
-firmware Servicer protocol):
-
-    bmRequestType = CTRL_IN/OUT | TYPE_VENDOR | RECIPIENT_DEVICE
-    bRequest      = 0
-    wValue        = 0x80 | cmdid   (read sets the high bit)
-    wIndex        = resid          (routes to the on-chip servicer)
-    wLength       = read: payload bytes + 1 status byte
-                    write: payload bytes only (no status prefix)
-
-Status code 64 (SERVICER_COMMAND_RETRY) means the DSP servicer is busy -
-retry up to 100 times with 10 ms sleeps. The first byte of a read response
-is always the status; payload bytes follow it. A busy servicer rejects
-writes with a USB stall, which surfaces as USBError.
-
-PARAMETERS mirrors the official Seeed xvf_host.py command table:
-name -> (resid, cmdid, count, access, type, description), where count is
-the number of values, not bytes: uint8/char are 1 byte each, uint16 is
-2 bytes, float/radians/int32/uint32 are 4 bytes each.
-"""
 
 from __future__ import annotations
 
@@ -35,7 +12,6 @@ VID = 0x2886
 PID = 0x001A
 
 CTRL_IN = 0xC0
-CTRL_OUT = 0x40
 STATUS_RETRY = 64
 RETRY_LIMIT = 100
 RETRY_DELAY = 0.01
@@ -45,10 +21,7 @@ _TYPE_SIZE = {"uint8": 1, "char": 1, "uint16": 2,
 _FMT = {"uint8": "B", "uint16": "H", "uint32": "I",
         "int32": "i", "float": "f", "radians": "f"}
 
-# name -> (resid, cmdid, count, access, type, description)
-# Kept in sync with Seeed python_control/xvf_host.py (sw_xvf3800).
 PARAMETERS = {
-    # APPLICATION_SERVICER_RESID commands
     "VERSION": (48, 0, 3, "ro", "uint8", "Firmware version: major, minor, patch"),
     "BLD_MSG": (48, 1, 50, "ro", "char", "Build message, normally the build configuration name"),
     "BLD_HOST": (48, 2, 30, "ro", "char", "CI build host used to build the firmware"),
@@ -63,7 +36,6 @@ PARAMETERS = {
     "AIC3104_HP_LEVEL": (48, 11, 1, "rw", "uint8", "AIC3104 headphone level [0..9]"),
     "AIC3104_LINEOUT_LEVEL": (48, 12, 1, "rw", "uint8", "AIC3104 lineout level [0..9]"),
 
-    # AEC_RESID commands
     "SHF_BYPASS": (33, 70, 1, "rw", "uint8", "AEC bypass"),
     "AEC_NUM_MICS": (33, 71, 1, "ro", "int32", "Number of microphone inputs into the AEC"),
     "AEC_NUM_FARENDS": (33, 72, 1, "ro", "int32", "Number of farend inputs into the AEC"),
@@ -98,7 +70,6 @@ PARAMETERS = {
     "AEC_FIXEDBEAMSONOFF": (33, 37, 1, "rw", "int32", "Fixed focused beam mode (0 off, 1 on)"),
     "AEC_FIXEDBEAMNOISETHR": (33, 38, 2, "rw", "float", "Noise canceller update threshold for fixed beam mode [0.0 .. 1.0]"),
 
-    # AUDIO_MGR_RESID commands
     "AUDIO_MGR_MIC_GAIN": (35, 0, 1, "rw", "float", "Pre-SHF microphone gain"),
     "AUDIO_MGR_REF_GAIN": (35, 1, 1, "rw", "float", "Pre-SHF reference gain"),
     "AUDIO_MGR_CURRENT_IDLE_TIME": (35, 2, 1, "ro", "int32", "Audio manager current idle time in 10ns ticks"),
@@ -128,7 +99,6 @@ PARAMETERS = {
     "AUDIO_MGR_SYS_DELAY": (35, 26, 1, "rw", "int32", "Reference signal delay in samples before the SHF algorithm"),
     "I2S_DAC_DSP_ENABLE": (35, 27, 1, "rw", "uint8", "DAC performs DSP on the far-end reference signal"),
 
-    # GPO_SERVICER_RESID commands
     "GPO_READ_VALUES": (20, 0, 5, "ro", "uint8", "Logic levels of GPO pins X0D11, X0D30, X0D31, X0D33, X0D39"),
     "GPO_WRITE_VALUE": (20, 1, 2, "wo", "uint8", "Set logic level of a selected GPO pin"),
     "GPO_PORT_PIN_INDEX": (20, 2, 2, "rw", "uint32", "GPO port/pin index the following commands target"),
@@ -143,7 +113,6 @@ PARAMETERS = {
     "DOA_VALUE": (20, 18, 2, "ro", "uint16", "payload[0] = azimuth 0-359, payload[1] = 1 if speech detected"),
     "LED_RING_COLOR": (20, 19, 12, "rw", "uint32", "Ring mode color, one per LED"),
 
-    # PP_RESID commands
     "PP_CURRENT_IDLE_TIME": (17, 70, 1, "ro", "uint32", "PP processing current idle time in 10ns ticks"),
     "PP_MIN_IDLE_TIME": (17, 71, 1, "ro", "uint32", "PP processing minimum idle time in 10ns ticks"),
     "PP_RESET_MIN_IDLE_TIME": (17, 72, 1, "wo", "uint32", "Reset the PP minimum idle time"),
@@ -176,43 +145,10 @@ PARAMETERS = {
     "PP_ATTNS_SLOPE": (17, 34, 1, "rw", "float", "Extra suppression during non-speech vs AGC level [0.0 .. 5.0]"),
 }
 
-# Commands that persist the running configuration into flash. Writing any of
-# these freezes whatever is currently in RAM as the power-on default, so a
-# beam left switched on would come back switched on after a reboot - which the
-# firmware documentation warns can hang the device (AEC_FIXEDBEAMSONOFF is only
-# meant to be set at runtime). This project therefore never persists: the
-# running configuration is deliberately volatile, and settings are reapplied
-# on each start instead. See ReSpeaker.write().
-FLASH_PERSIST_CMDS = frozenset({
-    "SAVE_CONFIGURATION",
-    "CLEAR_CONFIGURATION",
-})
-
-# Commands that reboot the chip or reset parameters to their defaults. They
-# would silently discard the beam configuration this program is holding, so
-# they are refused for the same reason: the only configuration anyone should
-# see is the one this run established.
-DISRUPTIVE_CMDS = frozenset({
-    "REBOOT",
-    "USB_BIT_DEPTH",
-    "TEST_CORE_BURN",
-})
-
-GUARDED_CMDS = FLASH_PERSIST_CMDS | DISRUPTIVE_CMDS
-
-
 def find():
-    """Locate the XVF3800 device.
-
-    Vendor control transfers are device-recipient EP0 requests: no
-    interface claim, kernel-driver detach or configuration change is
-    needed, so snd-usb-audio keeps streaming while VAD/DOA are polled.
-    """
     return usb.core.find(idVendor=VID, idProduct=PID)
 
-
 class ReSpeaker:
-    """Thin wrapper over the XVF3800 servicer protocol."""
 
     def __init__(self, timeout: int = 1000):
         self.timeout = timeout
@@ -230,24 +166,18 @@ class ReSpeaker:
             finally:
                 self.dev = None
 
-    # ------------------------------------------------------------------
-    def _transfer(self, resid: int, cmdid: int, out: bool,
-                  payload: bytes | None = None, w_length: int = 0):
-        bm = CTRL_OUT if out else CTRL_IN
-        w_value = cmdid if out else (0x80 | cmdid)
-        data = payload if out else w_length
-        return self.dev.ctrl_transfer(bm, 0, w_value, resid, data,
-                                      self.timeout)
+    def _transfer(self, resid: int, cmdid: int, w_length: int):
+        return self.dev.ctrl_transfer(CTRL_IN, 0, 0x80 | cmdid, resid,
+                                      w_length, self.timeout)
 
     def _read_raw(self, name: str) -> bytes:
         with self._lock:
             resid, cmdid, count, access, ptype, _ = PARAMETERS[name]
             if access == "wo":
                 raise ValueError(f"{name} is write-only")
-            w_length = count * _TYPE_SIZE[ptype] + 1  # +1 status byte
+            w_length = count * _TYPE_SIZE[ptype] + 1
             for _ in range(RETRY_LIMIT):
-                resp = self._transfer(resid, cmdid, out=False,
-                                      w_length=w_length)
+                resp = self._transfer(resid, cmdid, w_length=w_length)
                 if not resp:
                     raise RuntimeError(f"{name}: empty response")
                 status = int(resp[0])
@@ -258,77 +188,10 @@ class ReSpeaker:
                 time.sleep(RETRY_DELAY)
             raise RuntimeError(f"{name}: servicer busy after {RETRY_LIMIT} retries")
 
-    def _write_raw(self, name: str, payload: bytes) -> None:
-        with self._lock:
-            resid, cmdid, _, _, _, _ = PARAMETERS[name]
-            for attempt in range(RETRY_LIMIT):
-                try:
-                    self._transfer(resid, cmdid, out=True, payload=payload)
-                    return
-                except usb.core.USBError:
-                    # a busy servicer stalls the OUT transfer; retry
-                    if attempt == RETRY_LIMIT - 1:
-                        raise
-                    time.sleep(RETRY_DELAY)
-
-    # ------------------------------------------------------------------
     def read(self, name: str):
-        """Read a parameter: list of decoded values (str for char)."""
         _, _, count, _, ptype, _ = PARAMETERS[name]
         raw = self._read_raw(name)
         if ptype == "char":
             return raw.rstrip(b"\x00").decode("utf-8", errors="ignore")
         size = count * _TYPE_SIZE[ptype]
         return list(struct.unpack("<" + _FMT[ptype] * count, raw[:size]))
-
-    def write(self, name: str, value, allow_persist: bool = False) -> None:
-        """Write one parameter.
-
-        `allow_persist` exists so the refusal below is a deliberate, greppable
-        decision rather than something a future caller can trip over by
-        accident. No caller in this project passes it: see FLASH_PERSIST_CMDS
-        for why the configuration is kept volatile on purpose.
-        """
-        if name in GUARDED_CMDS and not allow_persist:
-            if name in FLASH_PERSIST_CMDS:
-                raise PermissionError(
-                    f"{name} writes the configuration to flash and is refused "
-                    f"by design: persisting a runtime parameter such as "
-                    f"AEC_FIXEDBEAMSONOFF can make the device hang on the next "
-                    f"boot. Settings are reapplied at each start instead."
-                )
-            raise PermissionError(
-                f"{name} reboots the chip or resets all parameters, which "
-                f"would discard the beam configuration this run established; "
-                f"it is refused by design."
-            )
-        _, _, count, access, ptype, _ = PARAMETERS[name]
-        if access == "ro":
-            raise ValueError(f"{name} is read-only")
-        if isinstance(value, str):
-            value = [value]
-        if not isinstance(value, (list, tuple)):
-            value = [value]
-        if len(value) != count:
-            raise ValueError(f"{name} expects {count} value(s), got {len(value)}")
-        if ptype == "char":
-            payload = str(value[0]).encode("utf-8")
-        elif ptype in ("float", "radians"):
-            payload = struct.pack("<" + "f" * count, *[float(v) for v in value])
-        else:
-            payload = struct.pack("<" + _FMT[ptype] * count,
-                                  *[int(v) for v in value])
-        self._write_raw(name, payload)
-
-    # convenience ---------------------------------------------------------
-    def read_vad(self) -> int:
-        """Hardware speech activity flag: DOA_VALUE payload[1]."""
-        vals = self.read("DOA_VALUE")
-        return int(vals[1]) if len(vals) > 1 else 0
-
-    def read_doa(self) -> tuple[float, int] | None:
-        """DOA_VALUE: (azimuth_deg 0-359, speech_activity 0/1)."""
-        vals = self.read("DOA_VALUE")
-        if not vals:
-            return None
-        return float(vals[0]), (int(vals[1]) if len(vals) > 1 else 0)

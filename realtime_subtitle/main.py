@@ -1,17 +1,3 @@
-"""Real-time bilingual subtitle entry: assembly, gating, segmentation.
-
-Single process, six concurrency units (PortAudio callback thread,
-VadDoaReader, this main loop, TranscriberWorker, TranslationThread,
-BroadcastServer) connected by queues. The main loop is a polling
-convergence loop: each 100 ms tick is an atomic transaction of drain
-inputs -> gate -> route audio -> dispatch results, and every heavy
-operation inside it is just a queue put.
-
-Gating is three layers: hardware VAD (energy, control plane) AND software
-VAD (Silero, inlined each tick) AND segment-level duration/ratio/energy
-filters at flush time. Discards always abort the streaming session, clear
-buffers, reset counters and return to idle so no partial is left behind.
-"""
 
 from __future__ import annotations
 
@@ -35,41 +21,25 @@ from .asr import AsrResult, detect_language
 from .compute import DEVICE_CHOICES, describe_platform
 from .segmenter import SegmentCfg, Segmenter, trim_tail
 
-# avoid XET download failures with huggingface_hub
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 SAMPLE_RATE = 16000
 
-VAD_INTERVAL = 0.1          # main loop tick, seconds
-SILENCE_HOLD = 0.6          # trailing silence before flush
+VAD_INTERVAL = 0.1
+SILENCE_HOLD = 0.6
 MIN_SECONDS = 0.3
-MAX_SECONDS = 20.0          # force-cut overlong segments
-PRE_ROLL = 1.0              # ring-buffer window retained before segment start
-SW_FRAME_THRESHOLD = 0.5    # Silero per-frame speech threshold
-SHORT_EXEMPT_SECONDS = 1.0  # short-segment exemption window
-SHORT_EXEMPT_MAX_PROB = 0.5 # peak probability required for exemption
-RATIO_THRESHOLD = 0.35      # segment speech-frame ratio floor
-TRIM_TAIL_ENERGY = 1e-4     # RMS below which tail frames are trimmed
+MAX_SECONDS = 20.0
+PRE_ROLL = 1.0
+SW_FRAME_THRESHOLD = 0.5
+SHORT_EXEMPT_SECONDS = 1.0
+SHORT_EXEMPT_MAX_PROB = 0.5
+RATIO_THRESHOLD = 0.35
+TRIM_TAIL_ENERGY = 1e-4
 
 ARRAY_DEVICE_NAMES = ("respeaker xvf3800", "xvf3800", "respeaker")
-
-# Which channel of the 6-channel capture stream to recognize. Fixed to the
-# "conference" processed output - the full AEC+beam+post-processing chain,
-# i.e. the one that has already done the work this program relies on. The
-# other channels are documented rather than exposed, because reaching them
-# meant carrying four CLI parameters (--audio-source/--ch/--in-channels) whose
-# only purpose was to pick an index:
-#   index 1 (banner ch2) -> ASR beam output (auto-select, no post)
-#   index 2..5           -> the four raw microphones, one per mic
 CAPTURE_CHANNEL = 0
 
-
 class VadDoaReader(threading.Thread):
-    """Poll DOA_VALUE (angle + speech activity) off the control plane.
-
-    Isolates USB control transfers (which can block 1 s+ on RETRY storms)
-    from the strictly-paced main loop.
-    """
 
     def __init__(self, device, interval: float = 0.1):
         super().__init__(daemon=True, name="VadDoaReader")
@@ -93,9 +63,7 @@ class VadDoaReader(threading.Thread):
     def stop(self) -> None:
         self._stop.set()
 
-
 class TranslationThread(threading.Thread):
-    """Serial NLLB worker; translation never blocks source display."""
 
     def __init__(self, translator, server, speech_end_at: dict | None = None):
         super().__init__(daemon=True, name="TranslationThread")
@@ -104,8 +72,6 @@ class TranslationThread(threading.Thread):
         self.speech_end_at = speech_end_at if speech_end_at is not None else {}
         self.job_queue: queue.Queue = queue.Queue()
         self._stop = threading.Event()
-        # rolling end-to-end stats, printed on the terminal only (the
-        # frontend stays a pure renderer and gets no latency fields)
         self._e2e_n = 0
         self._e2e_sum = 0.0
 
@@ -135,9 +101,6 @@ class TranslationThread(threading.Thread):
                     "text": text,
                     "target_lang": target,
                 })
-                # end-to-end stats: speech end -> translation printed here.
-                # Terminal-only (old-version semantics): latency measurement
-                # lives on the backend, the frontend never sees it.
                 speech_end = self.speech_end_at.pop(job["task_id"], None)
                 if speech_end is not None:
                     e2e = time.monotonic() - speech_end
@@ -152,16 +115,7 @@ class TranslationThread(threading.Thread):
     def stop(self) -> None:
         self._stop.set()
 
-
 class FinalDecodeThread(threading.Thread):
-    """Offline second-pass re-decode, decoupled from the streaming worker.
-
-    In 2-pass mode the offline model re-decodes the whole utterance (~1s for
-    a long sentence). Running that on the ASR worker would stall the next
-    utterance's feed queue and delay its first partial by the decode time.
-    This thread keeps the streaming worker free: online partials keep
-    flowing while the final text is being reconstructed.
-    """
 
     def __init__(self, provider, on_result):
         super().__init__(daemon=True, name="FinalDecodeThread")
@@ -192,13 +146,6 @@ class FinalDecodeThread(threading.Thread):
                 text = ""
                 mode = "2pass-final-failed"
 
-            # The offline pass can legitimately return nothing (very short or
-            # noisy audio) even though the online pass already recognized
-            # something. The card on screen was created by that partial, so
-            # the final result has to close it out one way or another - a
-            # final that never arrives leaves the text blinking forever.
-            # Promote the streaming partial rather than emitting an empty
-            # result for the caller to drop.
             if not text:
                 text = (job["partial_hint"] or "").strip()
                 if text:
@@ -222,10 +169,6 @@ class FinalDecodeThread(threading.Thread):
     def stop(self) -> None:
         self._stop.set()
 
-
-# ---------------------------------------------------------------------------
-# CLI / dependency resolution
-# ---------------------------------------------------------------------------
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="reSpeaker real-time bilingual subtitles")
     p.add_argument("--asr-chunk-size", choices=["480", "600"], default="480",
@@ -264,22 +207,7 @@ def parse_args(argv=None):
                    help="print per-tick gate inputs and every discard reason")
     return p.parse_args(argv)
 
-
-
-
-
 def resolve_input_device() -> int:
-    """Pick the input device: the XVF3800 array, else the system default.
-
-    Detection is by name fragment rather than a single string because the
-    array appears as "reSpeaker XVF3800" under PipeWire/Pulse but carries the
-    ALSA card name on a host without a sound server.
-
-    There is no override parameter on purpose. When the name had to be passed
-    explicitly, a typo was a hard startup error - the escape hatch was a way
-    to lose the run rather than a convenience, and the array is the only
-    device this program is for.
-    """
     import sounddevice as sd
 
     devs = [d for d in sd.query_devices() if d["max_input_channels"] > 0]
@@ -296,10 +224,6 @@ def resolve_input_device() -> int:
           f"input '{fallback_name}'")
     return default
 
-
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
 def main(argv=None) -> int:
     args = parse_args(argv)
     import sounddevice as sd
@@ -317,15 +241,10 @@ def main(argv=None) -> int:
               "software, so nothing will be recognized. Re-run with "
               "--no-hw-vad to gate on the software VAD alone.")
 
-    # ---- audio input ---------------------------------------------------
     input_device = resolve_input_device()
     dev_info = sd.query_devices(input_device, "input")
     in_channels = dev_info["max_input_channels"]
     ch_index = CAPTURE_CHANNEL
-    # Guard the fixed constant too: on a device with fewer channels the
-    # IndexError would otherwise surface inside the PortAudio callback thread,
-    # where it shows up as an unhandled callback exception instead of a usable
-    # message.
     if not 0 <= ch_index < in_channels:
         raise SystemExit(
             f"capture channel {ch_index} is out of range for "
@@ -363,7 +282,6 @@ def main(argv=None) -> int:
     sw_vad = SileroVad(threshold=SW_FRAME_THRESHOLD)
     print(f"[VAD] Silero software VAD ready (device {sw_vad.device})")
 
-    # ---- servers ---------------------------------------------------------
     from .control import ControlHandler
     from .ws_server import BroadcastServer
 
@@ -511,19 +429,13 @@ def main(argv=None) -> int:
             for _sig in (signal.SIGTERM, signal.SIGINT):
                 try:
                     signal.signal(_sig, _on_term)
-                except (ValueError, OSError):  # not the main thread / unavail.
+                except (ValueError, OSError):
                     pass
 
             print("[main] running - Ctrl+C to stop")
             while True:
                 now = time.time()
-
-
                 hw_vad = 0
-                # Initialised here, not inside the branch below: with
-                # --no-hw-vad there is no vad_reader, so that branch never
-                # runs and the debug print would raise NameError on the first
-                # audible tick - i.e. exactly when the flag is meant to help.
                 doa_last = None
                 while True:
                     try:
@@ -639,7 +551,6 @@ def main(argv=None) -> int:
             device.close()
         print("[main] stopped")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

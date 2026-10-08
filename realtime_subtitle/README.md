@@ -96,7 +96,7 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 
 这四个参数（`--audio-source`/`--ch`/`--in-channels`）的唯一作用就是选一个索引，因此已移除；需要换通道改 `main.py` 的 `CAPTURE_CHANNEL`。四路原始麦克风是固定的每麦一路，给它们起名字不比索引多出能力。
 
-波束（转向/路由）**不再由程序配置**，理由和实测数据见 [ARCHITECTURE.md](ARCHITECTURE.md) §8。该能力**不再有任何界面入口**：前端「USB 命令」面板与其后端命令已移除；设备层的 `usb_device.read()/write()` 与 flash 守卫仍保留，供将来需要时使用。
+波束（转向/路由）**不再由程序配置**，理由和实测数据见 [ARCHITECTURE.md](ARCHITECTURE.md) §8。该能力现在**没有任何入口**：前端「USB 命令」面板、其后端命令，以及 `usb_device.py` 的写入路径与 flash 守卫均已移除，该模块只读（详见 §8.2）。
 
 详细设计见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 

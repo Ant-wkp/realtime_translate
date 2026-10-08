@@ -1,10 +1,3 @@
-"""Broadcast server: one asyncio thread, thread-safe outbound queue.
-
-Producers (main loop, ASR/translation workers) call broadcast() which is
-always a cheap queue put. A _pump coroutine drains the queue at 10 ms
-intervals and pushes JSON to every /ws client. Inbound commands from the
-frontend land in a cmd_queue consumed by the main loop.
-"""
 
 from __future__ import annotations
 
@@ -17,7 +10,6 @@ from pathlib import Path
 from websockets.asyncio.server import serve
 from websockets.http11 import Request, Response
 from websockets.datastructures import Headers
-
 
 class BroadcastServer:
     def __init__(self, host: str = "0.0.0.0", port: int = 8765,
@@ -36,8 +28,6 @@ class BroadcastServer:
 
     def start(self, timeout: float = 5.0) -> None:
         self._thread.start()
-        # fail fast: abort the whole process if the port cannot be bound,
-        # instead of running a headless main loop with a dead web server.
         if not self._ready_evt.wait(timeout):
             raise RuntimeError("web server did not start in time")
         if self._bind_error is not None:
@@ -48,11 +38,9 @@ class BroadcastServer:
     def stop(self) -> None:
         self._stop_evt.set()
 
-    # called from any thread - cheap ------------------------------------
     def broadcast(self, msg: dict) -> None:
         self.out_queue.put(msg)
 
-    # ------------------------------------------------------------------
     def _run(self) -> None:
         asyncio.run(self._serve())
 
@@ -82,7 +70,7 @@ class BroadcastServer:
                                      ("Content-Length", str(len(body)))]),
                     body=body,
                 )
-            return None  # fall back -> 404
+            return None
 
         try:
             async with serve(
@@ -95,7 +83,7 @@ class BroadcastServer:
                 self._ready_evt.set()
                 pump = asyncio.create_task(self._pump())
                 try:
-                    await asyncio.Future()  # run until stopped
+                    await asyncio.Future()
                 finally:
                     pump.cancel()
         except OSError as exc:

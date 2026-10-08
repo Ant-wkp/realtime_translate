@@ -166,7 +166,7 @@ GPU 上试过三种量化类型，**`float16` 是唯一在真实运行条件下�
 
 因此启动流程不再写设备任何参数。波束相关的读写**再无任何界面入口**：前端「USB 命令」面板已随 `control.py` 的 `list_commands`/`read`/`write` 一并移除（理由同上——这段能力没有换来识别质量，却要带着一套必须回滚的设备状态）。
 
-> 设备层能力未被删除：`usb_device.py` 的 `read()`/`write()` 与守卫仍在，§8.1 的结论也仍然有效，那是将来若要重新启用波束的起点；只是当前没有任何调用方。
+> 设备层的写入能力与 flash 守卫**也已一并移除**（见 §8.2），`usb_device.py` 现在只读。§8.1 的结论仍然有效，是将来若要重新启用波束的起点。
 
 ### 8.1 实测结论（firmware 2.0.8）
 
@@ -185,19 +185,13 @@ GPU 上试过三种量化类型，**`float16` 是唯一在真实运行条件下�
 
 **未验证**：`SPENERGY` 能否在两人同时说话时分离两个波束——这正是放弃双波束的间接原因之一：6.7cm 孔径的物理上限没人测过，而单波束方案不依赖它。
 
-### 8.2 flash 守卫
+### 8.2 从不持久化：现在由架构保证
 
-`usb_device.py` 把命令分三类，只有第三类需要额外授权：
+`usb_device.py` **只读**。它曾经提供 `write()` 并配三个集合拦截会写 flash 的命令（`SAVE_CONFIGURATION`/`CLEAR_CONFIGURATION`）与会重启/重置的命令（`REBOOT`/`USB_BIT_DEPTH`/`TEST_CORE_BURN`），抛 `PermissionError`。
 
-| 集合 | 含义 | 行为 |
-|---|---|---|
-| `FLASH_PERSIST_CMDS` | 会写 flash（`SAVE_CONFIGURATION`/`CLEAR_CONFIGURATION`） | `write` 抛 `PermissionError`，除非显式 `allow_persist=True` |
-| `DISRUPTIVE_CMDS` | 会重启或改 USB 链路（`REBOOT`/`USB_BIT_DEPTH`/`TEST_CORE_BURN`） | 同上 |
-| `GUARDED_CMDS` | 以上两者的并集 | `write()` 据此抛出；两个子集决定错误措辞 |
+那套守卫连同它唯一的调用方（前端「USB 命令」面板）已一并移除。**结论不变但保证方式变了**：本项目仍然从不持久化 —— `AEC_FIXEDBEAMSONOFF` 写进固件后保存可能导致重启挂起 —— 但现在不是"有写入路径但被拦住"，而是**根本没有写入路径**。这比守卫更强：守卫只覆盖它枚举到的命令，而"没有入口"覆盖全部。
 
-本项目**从不持久化**：`AEC_FIXEDBEAMSONOFF` 写进固件后保存可能导致重启挂起，所以任何路径都拦得住。
-
-注：本节以前述及前端命令面板会展示 `blocked`/`block_reason` 标记，随该面板一并移除；守卫本身保留在 `usb_device.py`，现在没有程序内调用方。
+代价是失去了运行期写设备参数的能力（含只读之外的调试用途）。若要重新启用，需同时恢复写入路径与守卫；§8.1 的实测结论仍然有效，是那时的起点。
 
 ### 8.3 采集通道
 
