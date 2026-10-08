@@ -234,7 +234,7 @@
 # Verify with the network deliberately broken:
 #
 #   http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 \
-#       python main.py --device "reSpeaker XVF3800"
+#       python main.py
 #
 # A correct setup starts normally and logs zero connection failures. Note that
 # FunASR still attempts a hub check when given a bare alias, so the banner

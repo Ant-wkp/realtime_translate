@@ -27,8 +27,6 @@ else
     echo "run.sh: no venv at $VENV_DIR and no conda; using system python" >&2
 fi
 
-# --device is intentionally left to auto-detection: the name differs between
-# hosts (PipeWire exposes "reSpeaker XVF3800", ALSA exposes the card name).
-# `python main.py --list-devices` shows what is visible; pass --device only if
-# the wrong one is picked.
+# Device and capture channel are not configurable: the XVF3800 is detected by
+# name fragment and channel 0 (the conference processed output) is fixed.
 exec python -u main.py "$@"

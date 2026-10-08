@@ -13,19 +13,11 @@ python main.py
 
 # 流式粒度：480ms（默认，延迟低）/ 600ms（上游默认，前瞻更长）
 python main.py --asr-chunk-size 600
-
-# 换处理输出或直指采集通道
-python main.py --audio-source asr
-python main.py --ch 2
-
-# 列出音频设备
-python main.py --list-devices
-
-# 设备名与预期不符时显式指定（子串匹配，大小写不敏感）
-python main.py --device xvf3800
 ```
 
 也可以直接用 `./run.sh`（自动激活 venv 或 conda，并以 `python -u` 启动）。
+
+输入设备与采集通道**不可配置**：设备按名字自动识别 XVF3800（识别不到则回落系统默认并告警），采集固定取索引 0，即"处理输出"（AEC+波束+后处理完整链）。需要换通道时改 `main.py` 的 `CAPTURE_CHANNEL`。
 
 浏览器打开 <http://127.0.0.1:8765/>；从其他机器访问用本机 IP，例如 <http://192.168.5.21:8765/>（默认已绑定 `0.0.0.0`，可用 `--host` 改）。
 
@@ -46,8 +38,9 @@ python main.py --device xvf3800
 | `--nllb-device` | 同 `--device-type` | 仅翻译。aarch64 上 PyPI 的 ctranslate2 是纯 CPU 构建，会自动回落到 CPU `int8` 并打警告，而不是启动失败 |
 | `--nllb-compute-type` | 随设备 | 手动钉住量化类型（`int8` / `int8_float16` / `float16`）。**GPU 上不要用 int8**：与 ASR 并发时只有 6/24 成功，见 [ARCHITECTURE.md](ARCHITECTURE.md) §7.1.1 |
 | `--nllb-beam` | `1` | NLLB beam 宽度。贪心比 4 快约 20%（x86 246→198ms，Orin 1026→828ms）；译文读着别扭时可调到 4 |
-| `--vad-device` | `cpu` | Silero VAD 保持 CPU：模型极小但每秒调用 30 次，GPU 启动开销大于收益 |
 | `--no-hw-vad` | 关 | 仅用软件 VAD 门控。**控制面不可用时必须加**，否则硬件标志恒 0、门控恒假，表现为“跑起来但永远不出字幕” |
+
+Silero VAD 固定跑在 CPU（无 CLI 入口）：模型极小但每秒调用 30 次，GPU 启动开销大于收益，还会与 ASR 争显存。
 
 模型权重本身与平台无关（CT2 int8 / Paraformer state_dict 都不带 CPU/GPU 标志），差别只在引擎：torch 必须是 CUDA 构建、ctranslate2 必须编译了 CUDA。
 
@@ -93,15 +86,15 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 
 ### 采集通道映射
 
-采集流恒为 6 通道，但只有两个处理输出有名字——它们背后是两套不同的 DSP 链；其余靠 `--ch` 索引直达：
+采集流恒为 6 通道，程序固定取**索引 0（横幅 ch1）**，即"处理输出"（AEC+波束+后处理完整链）。其余通道不提供 CLI 入口，仅在此记录各自位置：
 
-| 通道 | `--audio-source` | 内容 |
+| 索引 | 横幅 | 内容 |
 |---|---|---|
-| ch0 | `conference`（默认） | 处理输出（AEC+波束+后处理） |
-| ch1 | `asr` | ASR 波束输出（auto-select，无后处理） |
-| ch2–ch5 | `--ch 2..5` | 四路原始麦克风 |
+| 0 | ch1 | 处理输出（AEC+波束+后处理）—— **程序使用的就是这个** |
+| 1 | ch2 | ASR 波束输出（auto-select，无后处理） |
+| 2–5 | ch3–ch6 | 四路原始麦克风，每麦一路 |
 
-不加 `--ch` 时只看 `--audio-source`；`--ch` 优先于它。四路原始麦克风是固定的每麦一路，再给它们起名字不比索引多出能力。
+这四个参数（`--audio-source`/`--ch`/`--in-channels`）的唯一作用就是选一个索引，因此已移除；需要换通道改 `main.py` 的 `CAPTURE_CHANNEL`。四路原始麦克风是固定的每麦一路，给它们起名字不比索引多出能力。
 
 波束（转向/路由）**不再由程序配置**，理由和实测数据见 [ARCHITECTURE.md](ARCHITECTURE.md) §8。该能力**不再有任何界面入口**：前端「USB 命令」面板与其后端命令已移除；设备层的 `usb_device.read()/write()` 与 flash 守卫仍保留，供将来需要时使用。
 

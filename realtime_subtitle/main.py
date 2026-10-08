@@ -44,7 +44,7 @@ VAD_INTERVAL = 0.1          # main loop tick, seconds
 SILENCE_HOLD = 0.6          # trailing silence before flush
 MIN_SECONDS = 0.3
 MAX_SECONDS = 20.0          # force-cut overlong segments
-PRE_ROLL_DEFAULT = 1.0      # ring-buffer window retained before segment start
+PRE_ROLL = 1.0              # ring-buffer window retained before segment start
 SW_FRAME_THRESHOLD = 0.5    # Silero per-frame speech threshold
 SHORT_EXEMPT_SECONDS = 1.0  # short-segment exemption window
 SHORT_EXEMPT_MAX_PROB = 0.5 # peak probability required for exemption
@@ -52,6 +52,18 @@ RATIO_THRESHOLD = 0.35      # segment speech-frame ratio floor
 TRIM_TAIL_ENERGY = 1e-4     # RMS below which tail frames are trimmed
 
 ARRAY_DEVICE_NAMES = ("respeaker xvf3800", "xvf3800", "respeaker")
+
+# Which channel of the 6-channel capture stream to recognize. Fixed to the
+# "conference" processed output - the full AEC+beam+post-processing chain,
+# i.e. the one that has already done the work this program relies on. The
+# other channels are documented rather than exposed, because reaching them
+# meant carrying four CLI parameters (--audio-source/--ch/--in-channels) whose
+# only purpose was to pick an index:
+#   index 1 (banner ch2) -> ASR beam output (auto-select, no post)
+#   index 2..5           -> the four raw microphones, one per mic
+CAPTURE_CHANNEL = 0
+
+
 class VadDoaReader(threading.Thread):
     """Poll DOA_VALUE (angle + speech activity) off the control plane.
 
@@ -219,28 +231,10 @@ def parse_args(argv=None):
     p.add_argument("--asr-chunk-size", choices=["480", "600"], default="480",
                    help="streaming decode stride: 480ms (default, lower latency) "
                         "or 600ms (upstream default, longer lookahead)")
-    p.add_argument("--audio-source", default="conference",
-                   choices=["conference", "asr"],
-                   help="which processed output to recognize: 'conference' is "
-                        "the full AEC+beam+post-processing chain, 'asr' is the "
-                        "shorter beamformer output")
-    p.add_argument("--ch", type=int, default=None,
-                   help="explicit capture channel index (0-based), overriding "
-                        "--audio-source. 0/1 are the two processed outputs, "
-                        "2-5 the raw microphones")
-    p.add_argument("--in-channels", type=int, default=None)
-    p.add_argument("--device", default=None, help="input device name substring")
     p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--vad-interval", type=float, default=VAD_INTERVAL)
-    p.add_argument("--silence-hold", type=float, default=SILENCE_HOLD)
-    p.add_argument("--min-seconds", type=float, default=MIN_SECONDS)
-    p.add_argument("--max-seconds", type=float, default=MAX_SECONDS)
-    p.add_argument("--pre-roll", type=float, default=PRE_ROLL_DEFAULT,
-                   help="seconds of audio retained before segment start; the "
-                        "first streaming chunk is filled from this ring buffer "
-                        "so the model decodes the opening words immediately "
-                        "instead of waiting 600ms for a full chunk")
-    p.add_argument("--list-devices", action="store_true")
+    p.add_argument("--vad-interval", type=float, default=VAD_INTERVAL,
+                   help="main-loop tick and DOA poll interval in seconds; also "
+                        "bounds how soon a segment can be flushed")
     p.add_argument("--device-type", choices=list(DEVICE_CHOICES),
                    default="auto",
                    help="inference device: 'auto' (default) uses CUDA when it "
@@ -258,11 +252,6 @@ def parse_args(argv=None):
                    help="NLLB beam width. Default is greedy (1), which is "
                         "about 20%% faster than 4 on both x86 and Orin; raise "
                         "it to 4+ if a translation reads badly")
-    p.add_argument("--vad-device", choices=list(DEVICE_CHOICES),
-                   default="cpu",
-                   help="Silero VAD device; CPU by default because the model "
-                        "runs 30 times per second and GPU launch overhead "
-                        "outweighs the gain")
     p.add_argument("--no-hw-vad", action="store_true",
                    help="gate on the software VAD alone. Needed when the "
                         "XVF3800 control plane is unavailable, otherwise the "
@@ -279,22 +268,21 @@ def parse_args(argv=None):
 
 
 
-def resolve_input_device(name: str | None) -> int:
-    """Pick the input device: explicit name match, else the XVF3800 array
-    (this program's expected hardware), else the system default."""
+def resolve_input_device() -> int:
+    """Pick the input device: the XVF3800 array, else the system default.
+
+    Detection is by name fragment rather than a single string because the
+    array appears as "reSpeaker XVF3800" under PipeWire/Pulse but carries the
+    ALSA card name on a host without a sound server.
+
+    There is no override parameter on purpose. When the name had to be passed
+    explicitly, a typo was a hard startup error - the escape hatch was a way
+    to lose the run rather than a convenience, and the array is the only
+    device this program is for.
+    """
     import sounddevice as sd
 
     devs = [d for d in sd.query_devices() if d["max_input_channels"] > 0]
-    if name is not None:
-        for d in devs:
-            if name.lower() in d["name"].lower():
-                return d["index"]
-        listing = "\n".join(f"  [{d['index']}] {d['name']} "
-                            f"({d['max_input_channels']} ch)" for d in devs)
-        raise RuntimeError(
-            f"input device not found: {name}\n"
-            f"available input devices:\n{listing or '  (none)'}"
-        )
     for d in devs:
         if any(frag in d["name"].lower() for frag in ARRAY_DEVICE_NAMES):
             return d["index"]
@@ -305,26 +293,8 @@ def resolve_input_device(name: str | None) -> int:
             fallback_name = d["name"]
             break
     print(f"[audio] WARNING: reSpeaker XVF3800 not detected, using default "
-          f"input '{fallback_name}' (pass --device <name> to override)")
+          f"input '{fallback_name}'")
     return default
-
-
-def resolve_audio_channel(args, in_channels: int) -> tuple[int, str]:
-    if args.ch is not None:
-        return args.ch, f"ch{args.ch + 1} (explicit)"
-    mapping = {"conference": 0, "asr": 1}
-    idx = mapping[args.audio_source]
-    if idx >= in_channels:
-        # a device with a single input channel still has to yield a channel 0
-        print(f"[audio] WARNING: --audio-source {args.audio_source} needs "
-              f"channel {idx + 1} but the device exposes {in_channels}; "
-              f"falling back to ch1")
-        idx = 0
-    desc = {
-        "conference": "Conference processed output (AEC+beam+post)",
-        "asr": "ASR beam output (auto-select, no post)",
-    }[args.audio_source]
-    return idx, desc
 
 
 # ---------------------------------------------------------------------------
@@ -334,9 +304,6 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     import sounddevice as sd
 
-    if args.list_devices:
-        print(sd.query_devices())
-        return 0
     device = None
     try:
         from .usb_device import ReSpeaker
@@ -351,17 +318,21 @@ def main(argv=None) -> int:
               "--no-hw-vad to gate on the software VAD alone.")
 
     # ---- audio input ---------------------------------------------------
-    input_device = resolve_input_device(args.device)
+    input_device = resolve_input_device()
     dev_info = sd.query_devices(input_device, "input")
-    in_channels = args.in_channels or dev_info["max_input_channels"]
-    ch_index, ch_desc = resolve_audio_channel(args, in_channels)
+    in_channels = dev_info["max_input_channels"]
+    ch_index = CAPTURE_CHANNEL
+    # Guard the fixed constant too: on a device with fewer channels the
+    # IndexError would otherwise surface inside the PortAudio callback thread,
+    # where it shows up as an unhandled callback exception instead of a usable
+    # message.
     if not 0 <= ch_index < in_channels:
         raise SystemExit(
-            f"--ch {ch_index} is out of range for '{dev_info['name']}' "
-            f"({in_channels} input channels)"
+            f"capture channel {ch_index} is out of range for "
+            f"'{dev_info['name']}' ({in_channels} input channels)"
         )
     print(f"[audio] device {input_device}, {in_channels} ch, "
-          f"extract ch{ch_index + 1}: {ch_desc}")
+          f"extract ch{ch_index + 1} (conference processed output)")
     print(f"[compute] {describe_platform()}")
 
     from .speaker_locator import SpeakerLocator
@@ -389,7 +360,7 @@ def main(argv=None) -> int:
           f"beam {translator.beam_size}, "
           f"{translator.zh_to}<-zh / {translator.other_to}<-other)")
 
-    sw_vad = SileroVad(threshold=SW_FRAME_THRESHOLD, device=args.vad_device)
+    sw_vad = SileroVad(threshold=SW_FRAME_THRESHOLD)
     print(f"[VAD] Silero software VAD ready (device {sw_vad.device})")
 
     # ---- servers ---------------------------------------------------------
@@ -458,10 +429,10 @@ def main(argv=None) -> int:
     if device is not None:
         vad_reader = VadDoaReader(device, interval=args.vad_interval)
         vad_reader.start()
-    seg_cfg = SegmentCfg(min_seconds=args.min_seconds,
-                         max_seconds=args.max_seconds,
-                         silence_hold=args.silence_hold,
-                         pre_roll=args.pre_roll,
+    seg_cfg = SegmentCfg(min_seconds=MIN_SECONDS,
+                         max_seconds=MAX_SECONDS,
+                         silence_hold=SILENCE_HOLD,
+                         pre_roll=PRE_ROLL,
                          short_exempt_seconds=SHORT_EXEMPT_SECONDS,
                          short_exempt_max_prob=SHORT_EXEMPT_MAX_PROB,
                          ratio_threshold=RATIO_THRESHOLD,
@@ -549,6 +520,11 @@ def main(argv=None) -> int:
 
 
                 hw_vad = 0
+                # Initialised here, not inside the branch below: with
+                # --no-hw-vad there is no vad_reader, so that branch never
+                # runs and the debug print would raise NameError on the first
+                # audible tick - i.e. exactly when the flag is meant to help.
+                doa_last = None
                 while True:
                     try:
                         snap = vad_reader.vad_queue.get_nowait() if vad_reader else None
@@ -573,9 +549,10 @@ def main(argv=None) -> int:
                 gate = segmenter.last_gate
 
                 if args.debug_gate and (hw_vad or sw_prob >= 0.05 or speaking):
+                    doa_txt = doa_last if doa_last is not None else "-"
                     print(f"[gate] hw={hw_vad} sw={sw_prob:.3f} gate={gate} "
                           f"state={'SPK' if speaking else 'IDLE'} "
-                          f"doa={doa_last}")
+                          f"doa={doa_txt}")
 
                 apply_actions(actions)
 
