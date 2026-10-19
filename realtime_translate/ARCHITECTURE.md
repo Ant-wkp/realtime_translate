@@ -1,8 +1,8 @@
-# 架构
+# realtime_translate 架构文档
 
 一句话：XVF3800 硬件负责音频增强与空间感知，Python 单进程多线程流水线负责门控/分段/识别/翻译，浏览器负责显示与运行时控制。
 
-## 1. 执行流（6 + 1）
+## 1. 执行流（7 条，不含模型引擎内部线程）
 
 | # | 执行流 | 类型 | 节拍 | 职责 |
 |---|---|---|---|---|
@@ -10,20 +10,25 @@
 | 2 | VadDoaReader | daemon | 100ms | USB 读 DOA_VALUE（语音标志 + 方位），入 vad_queue |
 | 3 | 主循环 | 显式循环 | sleep(0.1) | 排空队列、门控裁决、分段状态机、结果派发 |
 | 4 | TranscriberWorker | daemon | task_queue.get(0.5) | ASR 串行推理，保序 |
-| 5 | TranslationThread | daemon | job_queue.get(0.5) | NLLB 串行翻译 |
-| 6 | BroadcastServer | asyncio | _pump 10ms | WebSocket 广播 |
+| 5 | FinalDecodeThread | daemon | job_queue.get(0.5) | 整段离线重解、标点及 partial 兜底 |
+| 6 | TranslationThread | daemon | job_queue.get(0.5) | NLLB 串行翻译，上报成功或失败事件 |
+| 7 | BroadcastServer | asyncio | _pump 10ms | WebSocket 广播 |
 
-主循环内所有重操作都是队列 put；USB 控制传输（RETRY 可达 1s+）被 VadDoaReader 隔离在控制面。
+ASR 与翻译在后台线程推理，USB 控制传输被 VadDoaReader 隔离；软件 VAD、音频拼接与段级能量检查仍在主循环执行。字幕事件统一进入主循环，由 `SubtitleDispatcher` 维护段状态并广播，工作线程不直接广播字幕。
+
+默认模式在加载模型前连接 USB 并验证首次 `DOA_VALUE` 读取，探测预算 2 秒；失败时释放设备、提示 `--no-hw-vad` 并以非零状态退出。显式软件模式允许控制面缺失，主循环跳过不存在的读取队列。
+
+初始化失败、SIGINT 和 SIGTERM 共享清理路径：停止采集和新任务，取消排队任务，通知全部线程停止并在总计 5 秒内等待。USB 重试/轮询支持取消；Web 服务通过 asyncio 停止事件结束广播任务、连接及监听。仅在线程退出后关闭其资源，原生调用未返回时记录线程名、保留其资源并返回非零状态。本轮保持所有队列容量及过载策略不变。
 
 ## 2. 三层门控
 
 ```
 ① 硬件 VAD   XVF3800 固件能量门，走控制面
 ② 软件 VAD   Silero torch jit，主循环内联，512 帧 + carry
-③ 段级过滤   flush 时 O(1)：时长 → 占比 → 能量
+③ 段级过滤   flush 时：时长 → 占比 → 能量（能量检查遍历音频）
 ```
 
-模式只有一种：**每拍合取**（硬件标志 AND `sw_prob >= 0.35`）。两者都不能单独用——固件的标志是纯能量门，响度够就开（门铃也算）；Silero 是模型，持续噪声能把它骗成假阳性。合取后段级过滤还会再过一遍。
+默认模式为**每拍合取**（硬件标志 AND `sw_prob >= 0.5`）。`--no-hw-vad` 显式改为仅软件概率 ≥0.5。固件标志是能量门，Silero 也可能出现假阳性，因此默认保留合取，段结束时再执行过滤。`vad.state.gate_mode` 分别为 `and` / `software`，状态在本轮动作执行后读取。
 
 关键语义：
 
@@ -31,7 +36,7 @@
 - 占比分母只统计到最后一个有声 tick（句尾静音等待期不计入，防短句被稀释）
 - 时长只累加门开期间的样本（有声时长）：尾静音等待期约 0.6s，若计入则 `min_seconds` 形同虚设、短句豁免的 1s 阈值也会错位
 - 短句豁免仅对 <1s 且峰值概率 ≥0.5 的段生效（纯 avg_prob 豁免会放行 AGC 底噪）
-- 所有丢弃统一走 `discard_segment()`：stream_abort + 广播 discard + 清缓冲 + 复位 + 回 IDLE（防 partial 残留）
+- 分段丢弃统一走 `Segmenter.discard()`，调用端先注销字幕段并广播 discard，再提交 stream_abort；清缓冲、复位并回 IDLE，迟到事件不会重建字幕
 
 ## 3. 分段状态机
 
@@ -47,29 +52,32 @@ IDLE → SPEAKING → TRAILING_SILENCE → FLUSH ─┬→ DISCARD（统一丢�
 - 实现见 `segmenter.py`：`Segmenter` 持有全部状态，`feed(chunks, gate_fn, hw_vad, now)` 每次 tick 返回 `Action` 列表（`open`/`feed`/`flush`/`discard`），由 `main.py` 的 `apply_actions()` 翻译成对转录器与前端广播的调用。软 VAD 概率在 `Segmenter` 内部计算一次，同时驱动门控判定、统计与句尾确认，避免同一个 tick 出现多个读数
 - 该文件是纯逻辑、无 I/O，可脱离硬件测试（`tests/test_segmenter.py`）；`trim_tail()` 同时被 flush 的第三层过滤器与最终离线解码复用
 - 日志措辞由 `Segmenter` 生成（`Action.flush_line`/`debug_line`），与重构前的内联循环逐字一致
+- `feed(..., now)` 使用单调时钟；flush 的 `Action.speech_end_at` 保存最后一次有音频且门开的时间，避免把句尾等待排除在延迟统计之外
 
 ## 4. 推理层
 
 | 执行体 | 位置 | 模型 |
 |---|---|---|
 | sw VAD | 主循环内联 | Silero torch jit（官方 silero-vad 包 / 本地 silero_vad.jit） |
-| ASR | TranscriberWorker | FunASR paraformer-zh + ct-punc |
-| 翻译 | TranslationThread | NLLB-200-distilled-600M ct2-int8（1.3B 目录存在时优先） |
+| 在线 ASR | TranscriberWorker | FunASR paraformer-zh-streaming |
+| 离线 ASR + 标点 | FinalDecodeThread | FunASR paraformer-zh + ct-punc |
+| 翻译 | TranslationThread | NLLB-200-distilled-600M（1.3B 目录存在时优先）；CPU 默认 int8，GPU 默认 float16 |
 
-FunASR 流式 2-pass 契约：流式 generate 返回**增量文本**，provider 累计拼接为 partial；`finish_online()` 用 `is_final=True` 冲出尾字并立即广播，整段音频交给 `FinalDecodeThread` 离线重解出 final 替换 partial。
+FunASR 流式 2-pass 契约：流式 generate 返回**增量文本**，provider 累计拼接为 partial；`finish_online()` 用 `is_final=True` 冲出尾字并上报事件，整段音频交给 `FinalDecodeThread` 离线重解，由主循环派发 final 替换 partial。离线失败时保留在线文本作为终稿；无可用文本时丢弃该段。
 
 流式解码参数：`chunk_size` 默认 `[5,8,4]`（480ms stride，`--asr-chunk-size 600` 可换回上游默认 `[5,10,5]`），并显式传 `encoder_chunk_look_back=4` / `decoder_chunk_look_back=1`（仅在 cache 首次初始化时生效）。provider 只在累积文本增长时返回 non-empty，避免同一 stride 内重复广播相同 partial。
 
-语言路由：源语言由**识别文本的字形**判定（含假名→日语，含谚文→韩语，含汉字→中文，其余归为英语），不取 ASR 的 `language` 字段——FunASR 恒报 `zh`，那是"本模型输出中文"而非"听出的是中文"，若采信它则英语输入会走中→外分支，"其他语言→中文"形同虚设。非中文一律走 `other_to` 方向，未知源语种也照样翻译而非静默跳过。解码 beam=4 + length_penalty=1.0 + repetition_penalty=1.1；短段（<2 字符）不送翻译。
+语言路由：源语言由**识别文本的字形**判定（含假名→日语，含谚文→韩语，含汉字→中文，其余归为英语），不取 ASR 的 `language` 字段——FunASR 恒报 `zh`，那是"本模型输出中文"而非"听出的是中文"，若采信它则英语输入会走中→外分支，"其他语言→中文"形同虚设。非中文一律走 `other_to` 方向，未知源语种也照样翻译而非静默跳过。默认解码 beam=1 + length_penalty=1.0 + repetition_penalty=1.1；短段（<2 字符）跳过翻译模型推理、返回原文。
 
 ## 5. 数据流契约
 
 原文先推、译文补推、按 id 合并：
 
 ```
-flush 段(id) ──→ TranscriberWorker ──→ source(id) 立即广播
-                        │
-                        └→ TranslationThread ─→ translation(id) 补推
+flush 段(id) → TranscriberWorker → FinalDecodeThread → 主循环派发 final(id)
+                                                       │
+                         TranslationThread ← 翻译任务 ──┘
+                                └→ 结果事件 → 主循环派发 translation(id)
 前端按 id 合并双语卡片，翻译不阻塞原文显示
 ```
 
@@ -80,21 +88,23 @@ flush 段(id) ──→ TranscriberWorker ──→ source(id) 立即广播
       partial{id,ts,text}
       final{id,ts,doa,text,lang}
       discard{id}
-      translation{id,ts,text,target_lang}
+      translation{id,ts,text,target_lang,error?}
       vad.state{hw_vad,sw_prob,gate_mode,segment_state}
       cmd_result{ok,data|error}
 入站  cmd: get_target_langs / set_target_langs / get_zones / set_zones
 ```
 
-`translation` 只带 `id`——它按 id 归属，前端已在卡片上保留该 id。
+`SubtitleDispatcher` 的段状态为 `OPEN → FINISHING → FINALIZED → COMPLETE`。OPEN/FINISHING 接受 partial（含在线收尾），FINALIZED 拒绝 partial 与重复终稿，翻译完成或失败后注销；丢弃立即注销。未知 ID 的迟到事件均忽略，每段只提交一次翻译。`translation` 按 id 归属；失败时带可选 `error`，前端结束等待并显示“翻译失败”。
 
 设备参数命令（`list_commands`/`read`/`write`）已随前端「USB 命令」面板一并移除：本项目不再提供任何界面上的参数读写入口（见 §8）。
 
-延迟测量只留在后端终端（`[首字]` / `[耗时]` 行 + 退出汇总），前端是纯渲染器，不接收任何 latency 字段。
+延迟测量只留在后端终端（`[首字]` / `[耗时]` 行 + 退出汇总），前端不接收 latency 字段。单调时钟记录“开段→首个 partial 广播入队”和“末次门开→原文/译文广播入队”，包含句尾等待、排队和推理；消息 `ts` 保持墙上时间。原文派发不会移除译文需要的时间戳，所有计时状态仅由主循环维护。首字每段一次，无 partial 在终稿时计数，翻译失败单独统计、不纳入成功均值。这些指标不测量网络送达或浏览器渲染。
 
 ## 6. 前端
 
-单文件 `web/index.html`（后端只有 `/` 与 `/index.html` 路由，CSS/JS 全内联）。深色玻璃拟态；字幕状态机 partial 即时整段替换（后端发的是累积文本）→ final 整段替换 → discard 删除 → translation 填充；无逐字动画，每条消息到达即刻上屏。卡片上限 50 条；断线指数退避重连；XSS 全量转义。
+单文件 `web/index.html`（后端只有 `/` 与 `/index.html` 路由，CSS/JS 全内联）。深色玻璃拟态；字幕状态机 partial 即时整段替换（后端发的是累积文本）→ final 整段替换 → discard 删除 → translation 填充；终稿后的 partial 不覆盖卡片，翻译失败结束等待并显示提示。无逐字动画，卡片上限 50 条，断线指数退避重连，用户文本转义。
+
+自动跟随根据消息更新前是否接近底部判断，再在卡片新增、原文替换或译文填充后立即滚到最新内容，避免新增内容超过 80px 后被误判为用户正在查看历史。用户主动向上滚动时保留其阅读位置。
 
 顶部门控柱是四根 `#gate i`，由 `vad.state` 的 `hw_vad`/`segment_state` 驱动，`title` 显示门控模式。卡片 `.meta` 有 `partial` 与方位两个 pill，方位在段结束时才填。
 
@@ -102,7 +112,9 @@ flush 段(id) ──→ TranscriberWorker ──→ source(id) 立即广播
 
 设置抽屉只剩两组：翻译方向（改动即生效并持久化，见 §7.2）与 DOA 方位标签。「高级 / 设备参数」区块（USB 命令列表、读/写按钮）已移除，前端不再发送任何设备参数命令。
 
-## 7. 延迟预算（基线）
+## 7. 历史延迟预算与性能记录
+
+本节数值保留为此前环境与计时口径下的历史记录，不作为本轮修正后的性能验收结果。当前口径见 §5，需在真实硬件上重新测量。
 
 ```
 译文端到端 ~1.0s = silence_hold 0.6s(~60%) + 轮量化 ~10% + ASR 0.15~0.25s + NLLB 0.2~0.3s + WS <20ms
@@ -154,7 +166,7 @@ GPU 上试过三种量化类型，**`float16` 是唯一在真实运行条件下�
 
 一次真实会话（20 段）里 GPU 翻译落在 216–411 ms，`cuBLAS` 失败 0 次。ASR 占约 3 GB 显存，与翻译共存无冲突。
 
-**必须知道的陷阱**：用 `CUDA_DYNAMIC_LOADING=ON` 编译时，ct2 在运行时按 soname dlopen cuBLAS。**不要为了“帮它找到库”而用 `ctypes` 预先再加载一份** —— 实测有害：把同一 soname 的第二个副本塞进进程后，GEMM 会选到无法服务该矩阵形状的 kernel，表现为 `CUBLAS_STATUS_NOT_SUPPORTED`。在长短句混合的 40 次里：不预加载 **20/20 成功**，预加载 torch 版 **10/20 失败**。失败是**按输入文本确定性的**（某些句子必失败，同长度的另一些从不失败），而非库冲突该有的间歇性 —— 这也是区分两者的关键。`compute.ct2_cuda_library_status()` 因此只**报告** soname 可否解析、绝不加载任何东西。
+**必须知道的陷阱**：用 `CUDA_DYNAMIC_LOADING=ON` 编译时，ct2 在运行时按 soname dlopen cuBLAS。**不要为了“帮它找到库”而用 `ctypes` 预先再加载一份** —— 实测有害：把同一 soname 的第二个副本塞进进程后，GEMM 会选到无法服务该矩阵形状的 kernel，表现为 `CUBLAS_STATUS_NOT_SUPPORTED`。在长短句混合的 40 次里：不预加载 **20/20 成功**，预加载 torch 版 **10/20 失败**。失败是**按输入文本确定性的**（某些句子必失败，同长度的另一些从不失败），而非库冲突该有的间歇性 —— 这也是区分两者的关键。当前 `compute.ct2_cuda_library_status()` 使用 `ctypes.CDLL` 检查 soname，检查会加载动态库，但不指定 torch 的库副本或使用 `RTLD_GLOBAL`；本轮未修改该初始化策略。
 
 ### 7.2 翻译方向的持久化
 

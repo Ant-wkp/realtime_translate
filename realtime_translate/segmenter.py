@@ -32,6 +32,7 @@ class Action:
     seed_secs: float = 0.0
     seg_seconds: float = 0.0
     tail_wait: float = 0.0
+    speech_end_at: float | None = None
     delivered: bool = False
     reason: str = ""
     stream_opened: bool = False
@@ -233,7 +234,8 @@ class Segmenter:
         action = Action(kind="flush", seg_id=self.current_id, audio=audio,
                         delivered=True, flush_line=flush_line, debug_line=debug,
                         stream_opened=self.stream_opened,
-                        seg_seconds=now - self.seg_start, tail_wait=silence)
+                        seg_seconds=now - self.seg_start, tail_wait=silence,
+                        speech_end_at=self.last_speech_at)
         self.counters.flushed += 1
         self._reset(keep_speaking=False)
         return action

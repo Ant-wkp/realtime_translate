@@ -1,21 +1,35 @@
-# reSpeaker 实时双语字幕
+# realtime_translate — reSpeaker 实时翻译
 
-基于 reSpeaker XVF3800 麦克风阵列的本地实时双语字幕系统。硬件完成 AEC/波束成形/DOA/硬件 VAD，主机软件完成门控、分段、ASR 与翻译，浏览器实时显示双语字幕。
+基于 reSpeaker XVF3800 麦克风阵列的本地实时翻译系统。硬件完成 AEC/波束成形/DOA/硬件 VAD，主机软件完成门控、分段、ASR 与翻译，浏览器实时显示识别原文与译文。
 
 ## 快速开始
 
+工程根目录可位于任意路径。先将 `PROJECT_ROOT` 设置为同时包含 `realtime_translate/` 与 `tests/` 的工程根目录：
+
 ```bash
-conda activate funasr          # x86 开发机；Jetson 上用 venv，见下节
-cd realtime_subtitle
-
-# 默认：FunASR 流式 2-pass（说话期间即出 partial，整段音频 480ms 一步）
-python main.py
-
-# 流式粒度：480ms（默认，延迟低）/ 600ms（上游默认，前瞻更长）
-python main.py --asr-chunk-size 600
+export PROJECT_ROOT="/absolute/path/to/project"
 ```
 
-也可以直接用 `./run.sh`（自动激活 venv 或 conda，并以 `python -u` 启动）。
+```bash
+conda activate funasr          # x86 开发机；Jetson 上用 venv，见下节
+cd "$PROJECT_ROOT/realtime_translate"
+
+# 默认：FunASR 流式 2-pass（说话期间即出 partial，整段音频 480ms 一步）
+python -u main.py
+
+# 流式粒度：480ms（默认，延迟低）/ 600ms（上游默认，前瞻更长）
+python -u main.py --asr-chunk-size 600
+```
+
+Jetson AGX Orin 使用现有虚拟环境里的 Python 直接启动：
+
+```bash
+export VENV_DIR="/absolute/path/to/venv"  # 已安装依赖的虚拟环境
+cd "$PROJECT_ROOT/realtime_translate"
+"$VENV_DIR/bin/python" -u main.py
+```
+
+`-u` 使日志及时输出，重定向到文件时也能看到启动状态和耗时记录。
 
 输入设备与采集通道**不可配置**：设备按名字自动识别 XVF3800（识别不到则回落系统默认并告警），采集固定取索引 0，即"处理输出"（AEC+波束+后处理完整链）。需要换通道时改 `main.py` 的 `CAPTURE_CHANNEL`。
 
@@ -38,7 +52,7 @@ python main.py --asr-chunk-size 600
 | `--nllb-device` | 同 `--device-type` | 仅翻译。aarch64 上 PyPI 的 ctranslate2 是纯 CPU 构建，会自动回落到 CPU `int8` 并打警告，而不是启动失败 |
 | `--nllb-compute-type` | 随设备 | 手动钉住量化类型（`int8` / `int8_float16` / `float16`）。**GPU 上不要用 int8**：与 ASR 并发时只有 6/24 成功，见 [ARCHITECTURE.md](ARCHITECTURE.md) §7.1.1 |
 | `--nllb-beam` | `1` | NLLB beam 宽度。贪心比 4 快约 20%（x86 246→198ms，Orin 1026→828ms）；译文读着别扭时可调到 4 |
-| `--no-hw-vad` | 关 | 仅用软件 VAD 门控。**控制面不可用时必须加**，否则硬件标志恒 0、门控恒假，表现为“跑起来但永远不出字幕” |
+| `--no-hw-vad` | 关 | 显式选择仅用软件 VAD 门控。默认模式在加载模型前验证 USB 连接及首次 `DOA_VALUE` 读取，探测预算 2 秒；设备缺失、权限失败或超时会报错退出，提示添加本参数 |
 
 Silero VAD 固定跑在 CPU（无 CLI 入口）：模型极小但每秒调用 30 次，GPU 启动开销大于收益，还会与 ASR 争显存。
 
@@ -50,9 +64,11 @@ Orin 上翻译比 x86 慢约 4 倍（每句 ~0.8s vs ~0.2s），原因是 PyPI �
 
 ### Jetson / aarch64 部署
 
+在当前终端设置 `PROJECT_ROOT` 和 `VENV_DIR`；新环境可使用 `$PROJECT_ROOT/.venv`，已有环境使用其实际路径。以下命令在 `$PROJECT_ROOT/realtime_translate` 中执行。
+
 ```bash
 sudo apt-get install -y python3-pip python3-venv libportaudio2   # pip/venv/PortAudio 都非 pip 可提供
-python3 -m venv ~/venvs/subtitle && . ~/venvs/subtitle/bin/activate
+python3 -m venv "$VENV_DIR" && . "$VENV_DIR/bin/activate"
 
 # torch/torchaudio 必须是 CUDA 构建，否则 torch.cuda.is_available() 为 False，全部模型静默跑 CPU
 pip install --extra-index-url https://download.pytorch.org/whl/cu130 \
@@ -77,12 +93,17 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 - **数据面**：USB Audio 6ch → `audio_callback` 取出选定通道 → `audio_queue` → 主循环
 - **控制面**：USB vendor transfer → `VadDoaReader`（隔离 RETRY 长阻塞）→ `vad_queue`
 - **三层门控**：硬件 VAD ∧ Silero 软件 VAD ∧ flush 段级时长/占比/能量过滤
-- **推理流水线**：`TranscriberWorker`（ASR）→ 立即广播 `source(id)`；`TranslationThread`（NLLB ct2-int8）→ 同 id 补推 `translation`，翻译不阻塞原文
-- **前端**：单文件 `web/index.html`（后端仅服务 `/` 与 `/index.html`），partial 即时整段替换（无逐字动画）、final 整段替换、discard 删除、按 id 合并
+- **推理流水线**：`TranscriberWorker` 在线识别 → `FinalDecodeThread` 离线重解与标点 → 主循环派发 `final(id)`；`TranslationThread` 翻译完成后由主循环补推同 id 的 `translation`，翻译不阻塞原文
+- **字幕生命周期**：`SubtitleDispatcher` 在主循环管理 `OPEN → FINISHING → FINALIZED → COMPLETE`；丢弃立即注销，迟到事件及重复终稿被忽略，正常在线收尾 partial 仍保留
+- **前端**：单文件 `web/index.html`（后端仅服务 `/` 与 `/index.html`），partial 即时整段替换（无逐字动画）、final 整段替换、discard 删除、按 id 合并；根据消息更新前的滚动位置自动跟随新字幕，用户向上查看历史时保留其位置
 - **设备选择**：`compute.py` 集中所有平台相关决策（设备探测、量化类型、平台横幅），各 provider 不再自行猜测
 - **设置**：翻译方向改动即生效（`onchange`），并存入 `runtime_settings.json` 以便重启后保留；响应了抽屉上“运行时配置立即生效”的承诺
 
-延迟统计只打印在后端终端（`[首字]` / `[耗时]`），前端不接收 latency 字段。
+延迟统计只打印在后端终端（`[首字]` / `[耗时]`），前端不接收 latency 字段。计时使用单调时钟：首字统计“开段→首个 partial 广播入队”，原文/译文统计“末次门开→广播入队”，包含句尾等待和任务排队。这些不是浏览器实际渲染延迟；翻译失败单独统计，页面显示“翻译失败”。
+
+SIGINT/SIGTERM 会停止采集和新任务，取消尚未执行的任务，所有工作线程共享 5 秒退出等待预算。线程仍在原生推理调用中时，程序记录超时名称、以非零状态退出，并保留该线程仍在使用的资源。正常退出会释放 WebSocket 监听端口；初始化中途失败也走同一清理路径。
+
+本轮没有调整队列容量、积压处理或过载丢弃策略。
 
 ### 采集通道映射
 
@@ -113,7 +134,20 @@ sudo udevadm control --reload && sudo udevadm trigger
 sudo usermod -aG plugdev,audio $USER
 ```
 
-规则未生效时 `ReSpeaker()` 会抛 “reSpeaker XVF3800 not found (VID 0x2886 / PID 0x001A)”（能枚举设备但读参数会 `Access denied`），程序继续运行但门控永不开——此时加 `--no-hw-vad` 可先只靠软件 VAD 跑起来。
+设备不存在时会报告 `reSpeaker XVF3800 not found`；能够枚举但权限不足时，首次参数读取会报告访问失败。默认硬件模式在加载模型前报错退出；添加 `--no-hw-vad` 后允许 USB 控制面不可用，但仍需要可用的音频输入设备。
+
+## 回归与人工验收
+
+在仓库根目录、已安装依赖的 Python 环境中运行：
+
+```bash
+python -B -m unittest discover -s tests -v
+node tests/test_web_translate.js
+```
+
+自动测试使用假模型、合成音频与 USB 替身，不下载模型、不访问麦克风；WebSocket 测试仅监听本机回环，验证停止、连接关闭及端口重新绑定。
+
+真实硬件验收需分别运行默认模式和 `--no-hw-vad`，用外部声源或直接说话，确认 partial、final、译文依次更新；用 Ctrl+C 停止后立即重启，确认同一端口可用。设备控制面不可用时，再确认默认模式明确报错退出。历史性能数据不是本轮修正后的验收结果。
 
 ### 用自播做冒烟测试时的注意点
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>reSpeaker 实时双语字幕</title>
+<title>reSpeaker 实时翻译</title>
 <style>
 :root{
   --glass: rgba(255,255,255,.06);
@@ -248,7 +248,7 @@ select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--
 <body>
 <header>
   <div class="logo"></div>
-  <h1>reSpeaker 实时双语字幕</h1>
+  <h1>reSpeaker 实时翻译</h1>
   <div class="spacer"></div>
   <div id="gate" title="语音活动"><i></i><i></i><i></i><i></i></div>
   <div id="dot" title="连接状态"></div>
@@ -280,7 +280,7 @@ select:focus,input[type=text]:focus,input[type=number]:focus{border-color:var(--
       <label for="otherTo">其他语言 →</label>
       <select id="otherTo"></select>
     </div>
-    <div class="sub">源语言按字幕文本判定：含假名→日语，含谚文→韩语，
+    <div class="sub">源语言按识别文本判定：含假名→日语，含谚文→韩语，
       含汉字→中文，其余归为英语；识别不到的按“其他语言”处理。</div>
     <div class="actions"><button class="btn" id="saveLangs">保存方向</button></div>
   </div>
@@ -340,11 +340,9 @@ function toast(msg, kind){
 function nearBottom(){
   return stream.scrollHeight - stream.scrollTop - stream.clientHeight <= 80;
 }
-function scrollIfStuck(){
-  if (!nearBottom()) return;
-  const gap = stream.scrollHeight - stream.scrollTop - stream.clientHeight;
-  stream.scrollTo({top: stream.scrollHeight,
-                   behavior: gap > 24 ? "smooth" : "auto"});
+function scrollIfStuck(shouldStick){
+  if (!shouldStick) return;
+  stream.scrollTo({top: stream.scrollHeight, behavior: "auto"});
 }
 function removeEmpty(){
   if (empty && empty.parentNode) empty.remove();
@@ -386,6 +384,7 @@ function stampDoa(el, doa){
   p.hidden = false;
 }
 function freezeCard(el, lang){
+  el.dataset.finalized = "true";
   const cur = el.querySelector(".cursor");
   if (cur) cur.remove();
   const trans = el.querySelector(".trans");
@@ -401,6 +400,9 @@ function freezeCard(el, lang){
 }
 
 function handle(msg){
+  // Decide before card updates change the height; follow without an animation
+  // so the next partial or translation still sees the viewport at the bottom.
+  const shouldStick = nearBottom();
   switch (msg.type){
     case "source": {
       removeEmpty();
@@ -408,7 +410,7 @@ function handle(msg){
       freezeCard(el, msg.lang);
       stampDoa(el, msg.doa);
       el.querySelector(".src-text").textContent = msg.text || "";
-      scrollIfStuck();
+      scrollIfStuck(shouldStick);
       break;
     }
     case "final": {
@@ -417,15 +419,17 @@ function handle(msg){
       freezeCard(el, msg.lang);
       stampDoa(el, msg.doa);
       el.querySelector(".src-text").textContent = msg.text || "";
-      scrollIfStuck();
+      scrollIfStuck(shouldStick);
       break;
     }
     case "partial": {
+      const existing = cards.get(msg.id);
+      if (existing && existing.dataset.finalized === "true") break;
       removeEmpty();
       const el = cardFor(msg.id, true);
       el.querySelector(".src-text").textContent = msg.text || "";
       setSide(el, guessSide(msg.text || ""));
-      scrollIfStuck();
+      scrollIfStuck(shouldStick);
       break;
     }
     case "discard": {
@@ -439,9 +443,10 @@ function handle(msg){
       if (el){
         const t = el.querySelector(".trans");
         t.className = "trans";
-        t.textContent = msg.text || "";
+        t.textContent = msg.error ? "翻译失败" : (msg.text || "");
+        t.title = msg.error || "";
       }
-      scrollIfStuck();
+      scrollIfStuck(shouldStick);
       break;
     }
     case "vad.state": {

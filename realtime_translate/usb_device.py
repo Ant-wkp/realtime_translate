@@ -166,18 +166,33 @@ class ReSpeaker:
             finally:
                 self.dev = None
 
-    def _transfer(self, resid: int, cmdid: int, w_length: int):
+    def _transfer(self, resid: int, cmdid: int, w_length: int,
+                  timeout: int | None = None):
         return self.dev.ctrl_transfer(CTRL_IN, 0, 0x80 | cmdid, resid,
-                                      w_length, self.timeout)
+                                      w_length, self.timeout if timeout is None else timeout)
 
-    def _read_raw(self, name: str) -> bytes:
+    def _read_raw(self, name: str, stop_event: threading.Event | None = None,
+                  deadline: float | None = None) -> bytes:
         with self._lock:
             resid, cmdid, count, access, ptype, _ = PARAMETERS[name]
             if access == "wo":
                 raise ValueError(f"{name} is write-only")
             w_length = count * _TYPE_SIZE[ptype] + 1
             for _ in range(RETRY_LIMIT):
-                resp = self._transfer(resid, cmdid, w_length=w_length)
+                if stop_event is not None and stop_event.is_set():
+                    raise InterruptedError(f"{name}: read cancelled")
+                timeout = self.timeout
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f"{name}: probe deadline exceeded")
+                    timeout = min(timeout, max(1, int(remaining * 1000)))
+                resp = self._transfer(resid, cmdid, w_length=w_length,
+                                      timeout=timeout)
+                if stop_event is not None and stop_event.is_set():
+                    raise InterruptedError(f"{name}: read cancelled")
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(f"{name}: probe deadline exceeded")
                 if not resp:
                     raise RuntimeError(f"{name}: empty response")
                 status = int(resp[0])
@@ -185,12 +200,20 @@ class ReSpeaker:
                     return bytes(resp[1:])
                 if status != STATUS_RETRY:
                     raise RuntimeError(f"{name}: servicer status {status}")
-                time.sleep(RETRY_DELAY)
+                delay = RETRY_DELAY
+                if deadline is not None:
+                    delay = min(delay, max(0.0, deadline - time.monotonic()))
+                if stop_event is not None:
+                    if stop_event.wait(delay):
+                        raise InterruptedError(f"{name}: read cancelled")
+                else:
+                    time.sleep(delay)
             raise RuntimeError(f"{name}: servicer busy after {RETRY_LIMIT} retries")
 
-    def read(self, name: str):
+    def read(self, name: str, *, stop_event: threading.Event | None = None,
+             deadline: float | None = None):
         _, _, count, _, ptype, _ = PARAMETERS[name]
-        raw = self._read_raw(name)
+        raw = self._read_raw(name, stop_event=stop_event, deadline=deadline)
         if ptype == "char":
             return raw.rstrip(b"\x00").decode("utf-8", errors="ignore")
         size = count * _TYPE_SIZE[ptype]

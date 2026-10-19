@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from realtime_subtitle.segmenter import (    # noqa: E402
+from realtime_translate.segmenter import (    # noqa: E402
     SegmentCfg, Segmenter, trim_tail,
 )
 
@@ -165,6 +165,32 @@ class TestFilters(unittest.TestCase):
 
 
 class TestEndOfUtterance(unittest.TestCase):
+    def test_flush_timestamp_includes_early_tail_wait(self):
+        probs = [0.9] * 10 + [0.02] * 20
+        seg = make(probs)
+        fl = next(a for a in drive(seg, probs) if a.kind == "flush")
+        self.assertAlmostEqual(fl.speech_end_at, 0.9)
+        self.assertAlmostEqual(fl.tail_wait, 0.3)
+        self.assertAlmostEqual(fl.seg_seconds - fl.speech_end_at, fl.tail_wait)
+
+    def test_flush_timestamp_includes_full_tail_wait(self):
+        probs = [0.9] * 10 + [0.3] * 20
+        seg = make(probs)
+        fl = next(a for a in drive(seg, probs) if a.kind == "flush")
+        self.assertAlmostEqual(fl.speech_end_at, 0.9)
+        self.assertAlmostEqual(fl.tail_wait, 0.6)
+        self.assertAlmostEqual(fl.seg_seconds - fl.speech_end_at, fl.tail_wait)
+
+    def test_forced_cut_has_current_speech_timestamp(self):
+        probs = [0.9] * 40
+        seg = make(probs, max_seconds=1.0)
+        flushes = [a for a in drive(seg, probs) if a.kind == "flush"]
+        self.assertGreaterEqual(len(flushes), 3)
+        self.assertTrue(all(a.tail_wait == 0.0 for a in flushes))
+        self.assertTrue(all(a.speech_end_at > 0.0 for a in flushes))
+        self.assertEqual(sorted(a.speech_end_at for a in flushes),
+                         [a.speech_end_at for a in flushes])
+
     def test_silence_ends_early(self):
         # A trailing silence is normally cut at the 0.3s early-end mark, well
         # before silence_hold; this is the common path for real utterances.

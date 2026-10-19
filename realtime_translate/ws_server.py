@@ -5,6 +5,7 @@ import asyncio
 import json
 import queue
 import threading
+from contextlib import suppress
 from pathlib import Path
 
 from websockets.asyncio.server import serve
@@ -12,6 +13,8 @@ from websockets.http11 import Request, Response
 from websockets.datastructures import Headers
 
 class BroadcastServer:
+    name = "BroadcastServer"
+
     def __init__(self, host: str = "0.0.0.0", port: int = 8765,
                  cmd_queue: queue.Queue | None = None):
         self.host = host
@@ -22,13 +25,17 @@ class BroadcastServer:
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="BroadcastServer")
         self._loop = None
+        self._async_stop = None
         self._stop_evt = threading.Event()
         self._ready_evt = threading.Event()
         self._bind_error: BaseException | None = None
 
     def start(self, timeout: float = 5.0) -> None:
+        if self._stop_evt.is_set():
+            raise RuntimeError("web server has already been stopped")
         self._thread.start()
         if not self._ready_evt.wait(timeout):
+            self.stop()
             raise RuntimeError("web server did not start in time")
         if self._bind_error is not None:
             raise RuntimeError(
@@ -37,15 +44,34 @@ class BroadcastServer:
 
     def stop(self) -> None:
         self._stop_evt.set()
+        if self._loop is not None and self._async_stop is not None:
+            with suppress(RuntimeError):
+                self._loop.call_soon_threadsafe(self._async_stop.set)
+
+    def join(self, timeout: float | None = None) -> None:
+        if self._thread.ident is not None:
+            self._thread.join(timeout)
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
 
     def broadcast(self, msg: dict) -> None:
-        self.out_queue.put(msg)
+        if not self._stop_evt.is_set():
+            self.out_queue.put(msg)
 
     def _run(self) -> None:
-        asyncio.run(self._serve())
+        try:
+            asyncio.run(self._serve())
+        except Exception as exc:
+            self._bind_error = exc
+        finally:
+            self._ready_evt.set()
 
     async def _serve(self) -> None:
         self._loop = asyncio.get_running_loop()
+        self._async_stop = asyncio.Event()
+        if self._stop_evt.is_set():
+            self._async_stop.set()
         web_dir = Path(__file__).parent / "web"
 
         async def handler(ws):
@@ -56,7 +82,8 @@ class BroadcastServer:
                         msg = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-                    self.cmd_queue.put(msg)
+                    if not self._stop_evt.is_set():
+                        self.cmd_queue.put(msg)
             finally:
                 self.clients.discard(ws)
 
@@ -79,13 +106,19 @@ class BroadcastServer:
                 self.port,
                 process_request=http_handler,
                 ping_interval=20,
-            ):
+                close_timeout=1,
+            ) as listener:
+                if not listener.sockets:
+                    raise RuntimeError("no listening sockets; check bind permissions and host address")
+                self.port = listener.sockets[0].getsockname()[1]
                 self._ready_evt.set()
                 pump = asyncio.create_task(self._pump())
                 try:
-                    await asyncio.Future()
+                    await self._async_stop.wait()
                 finally:
                     pump.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await pump
         except OSError as exc:
             self._bind_error = exc
             self._ready_evt.set()
